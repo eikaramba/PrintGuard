@@ -14,3 +14,4 @@ web/dist-site/
 web/test-results/
 plugins/*.zip
 .claude/settings.local.json
+proxmox
