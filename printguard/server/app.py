@@ -77,7 +77,7 @@ def origin_allowed(connection: HTTPConnection, allowed: set[str]) -> bool:
     return bool(host) and urlsplit(origin).netloc == host.split(",")[0].strip()
 
 
-GATE_EXEMPT_PREFIXES = ("/api/health",)
+GATE_EXEMPT_PREFIXES = ("/api/health", "/api/v1/status")
 GATE_CACHE_TTL_S = 10.0
 PLUGIN_REQUEST_HEADERS = ("cookie", "authorization", "accept", "content-type", "x-forwarded-for", "user-agent")
 PLUGIN_RESPONSE_HEADERS = ("set-cookie", "location", "cache-control")
@@ -266,6 +266,19 @@ def create_app() -> FastAPI:
         """Reports hub readiness and the running version."""
         response.headers["Cache-Control"] = "no-store"
         return {"ok": True, "version": app.state.engine.platform.version}
+
+    @app.get("/api/v1/status")
+    def status(response: Response) -> dict[str, Any]:
+        """Reports hub health and active inference device."""
+        response.headers["Cache-Control"] = "no-store"
+        stats = app.state.engine.scheduler.stats()
+        return {
+            "ok": True,
+            "version": app.state.engine.platform.version,
+            "inference_device": stats.get("inference_device", ""),
+            "infer_ms": stats.get("infer_ms", 0),
+            "capacity_fps": stats.get("capacity_fps", 0),
+        }
 
     @app.websocket("/api/ws")
     async def engine_socket(websocket: WebSocket) -> None:

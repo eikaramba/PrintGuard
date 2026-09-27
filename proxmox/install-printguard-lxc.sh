@@ -8,6 +8,7 @@
 # ==============================================================================
 
 set -euo pipefail
+export PATH="/usr/local/bin:$PATH"
 
 # Visual formatting
 GREEN='\033[0;32m'
@@ -79,7 +80,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
 log_info "Configuring AMD ROCm 7.2.4 apt repository..."
 mkdir -p /etc/apt/keyrings
 if [ ! -f /etc/apt/keyrings/rocm.gpg ]; then
-    curl -fsSL https://repo.radeon.com/rocm/rocm.gpg | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
+    curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
 fi
 
 cat <<'EOF' > /etc/apt/sources.list.d/rocm.list
@@ -89,7 +90,7 @@ EOF
 # Pin ROCm packages to prevent breaking partial upgrades
 cat <<'EOF' > /etc/apt/preferences.d/rocm
 Package: *
-Pin: origin "repo.radeon.com"
+Pin: origin repo.radeon.com
 Pin-Priority: 600
 EOF
 
@@ -145,15 +146,18 @@ cd "${INSTALL_DIR}"
 
 # 8. Setup Python virtual environment
 log_info "Setting up Python virtual environment with uv..."
-uv venv --python python3.12 "${INSTALL_DIR}/.venv"
+uv venv --seed --python python3.12 "${INSTALL_DIR}/.venv"
 
 # 9. Install onnxruntime-migraphx wheel from AMD ROCm repository
 log_info "Installing onnxruntime-migraphx for ROCm 7.2.4..."
-MIGRAPHX_WHEEL_URL="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_28_x86_64.whl"
+MIGRAPHX_WHEEL_URL="https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.4/onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
+FALLBACK_WHEEL_URL="https://github.com/Looong01/onnxruntime-rocm-build/releases/download/v1.23.2/onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_34_x86_64.whl"
 
 # Install AMD wheel without pulling standard onnxruntime
-"${INSTALL_DIR}/.venv/bin/pip" install --no-deps "${MIGRAPHX_WHEEL_URL}" || {
-    log_warn "Failed to fetch remote AMD wheel directly; trying fallback or continuing."
+"${INSTALL_DIR}/.venv/bin/pip" install --no-deps "${MIGRAPHX_WHEEL_URL}" || \
+"${INSTALL_DIR}/.venv/bin/pip" install --no-deps "${FALLBACK_WHEEL_URL}" || {
+    log_err "Failed to install onnxruntime-migraphx wheel!"
+    exit 1
 }
 
 # 10. Install project dependencies via uv
@@ -166,6 +170,7 @@ if [ -f "${INSTALL_DIR}/pyproject.toml" ]; then
         "ai-edge-litert>=2.1.5" \
         "aiomqtt>=2.5.1" \
         "av>=14.0" \
+        "coloredlogs" \
         "fastapi>=0.136.3" \
         "fastmcp>=3.4.2" \
         "httpx>=0.28" \
@@ -173,11 +178,14 @@ if [ -f "${INSTALL_DIR}/pyproject.toml" ]; then
         "numpy>=2.1,<2.2" \
         "packaging>=24.0" \
         "paho-mqtt>=2.1" \
+        "flatbuffers" \
         "pillow>=10" \
+        "protobuf" \
         "pycentauri>=0.7.0" \
         "pydantic-settings>=2.14.2" \
         "pyprusalink>=3.0" \
         "starlette>=1.3.1" \
+        "sympy" \
         "uvicorn[standard]>=0.49.0" \
         "wasmtime>=47.0"
 fi
@@ -242,6 +250,9 @@ EOF
 
 systemctl daemon-reload
 systemctl enable printguard.service
+if [ -f "${INSTALL_DIR}/proxmox/PRINTGUARD_LXC_HANDOFF.md" ]; then
+    cp "${INSTALL_DIR}/proxmox/PRINTGUARD_LXC_HANDOFF.md" /root/PRINTGUARD_LXC_HANDOFF.md
+fi
 
 echo -e "${GREEN}====================================================${NC}"
 echo -e "${GREEN}PrintGuard installation complete!${NC}"

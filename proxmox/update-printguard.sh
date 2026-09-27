@@ -5,6 +5,7 @@
 # ==============================================================================
 
 set -euo pipefail
+export PATH="/opt/rocm/bin:/usr/local/bin:$PATH"
 
 INSTALL_DIR="/opt/printguard"
 cd "${INSTALL_DIR}"
