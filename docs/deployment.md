@@ -15,6 +15,7 @@ your trusted network.
 - [Option 1: Tailscale](#option-1-tailscale)
 - [Option 2: Cloudflare Tunnel and Access](#option-2-cloudflare-tunnel-and-access)
 - [Option 3: oauth2-proxy on your own domain](#option-3-oauth2-proxy-on-your-own-domain)
+- [Native Linux & Proxmox LXC](#native-linux--proxmox-lxc)
 - [Origin checking](#origin-checking)
 - [Plugins](#plugins)
 - [Hardening checklist](#hardening-checklist)
@@ -133,6 +134,21 @@ GitHub, Google or any OIDC provider and proxies everything, WebSockets included:
 
 Terminate TLS in front with Caddy, nginx or a Cloudflare Tunnel pointed at `:4180`, and bind
 PrintGuard's own port to localhost so the proxy is the only way in.
+
+## Native Linux & Proxmox LXC
+
+PrintGuard can run natively on bare-metal Linux or inside an unprivileged Proxmox LXC container
+without Docker.
+
+1. **Prerequisites:** Python 3.12+, Node.js 22 (to build the web dashboard), and Astral `uv`.
+2. **MediaMTX:** Place the standalone `mediamtx` binary in `/usr/local/bin/mediamtx`. PrintGuard
+   automatically finds it on `PATH` or via the `MEDIAMTX_BINARY` environment variable.
+3. **Web dashboard:** Run `npm ci && npm run build` inside `web/` to produce `web/dist`.
+4. **Service:** Manage the hub using a systemd service running `printguard` from the virtualenv.
+
+For Proxmox VE hosts sharing an AMD GPU (such as AMD Strix Halo, `gfx1151`) into an unprivileged
+LXC container, see the full guide and provisioning scripts in `proxmox/PRINTGUARD_LXC_HANDOFF.md`,
+`proxmox/create-printguard-lxc.sh`, and `proxmox/install-printguard-lxc.sh`.
 
 ## Origin checking
 

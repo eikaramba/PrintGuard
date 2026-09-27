@@ -85,7 +85,10 @@ def deployment(packaged: bool) -> str:
     """
     if packaged:
         return "macos" if sys.platform == "darwin" else "windows"
-    return f"docker{os.environ.get('PRINTGUARD_VARIANT', '')}"
+    variant = os.environ.get("PRINTGUARD_VARIANT", "")
+    if variant in ("linux", "linux-amd"):
+        return variant
+    return f"docker{variant}"
 
 
 def _v4l2_card(node: Path) -> str | None:

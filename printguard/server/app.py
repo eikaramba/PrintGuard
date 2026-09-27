@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
@@ -52,7 +53,8 @@ class WebStaticFiles(StaticFiles):
 
     async def get_response(self, path: str, scope: Scope) -> Response:
         response = await super().get_response(path, scope)
-        response.headers["Cache-Control"] = ASSET_CACHE_CONTROL if path.startswith("assets/") else REVALIDATE_CACHE_CONTROL
+        normalized = path.replace("\\", "/")
+        response.headers["Cache-Control"] = ASSET_CACHE_CONTROL if normalized.startswith("assets/") else REVALIDATE_CACHE_CONTROL
         return response
 
 
@@ -121,7 +123,7 @@ def create_app() -> FastAPI:
     mediamtx_api = os.environ.get("MEDIAMTX_API", "http://localhost:9997")
     mediamtx_rtsp = os.environ.get("MEDIAMTX_RTSP", "rtsp://localhost:8554").rstrip("/")
     mediamtx_hls = os.environ.get("MEDIAMTX_HLS", "http://localhost:8888")
-    mediamtx_binary = os.environ.get("MEDIAMTX_BINARY")
+    mediamtx_binary = os.environ.get("MEDIAMTX_BINARY") or shutil.which("mediamtx")
     mediamtx_config = os.environ.get("MEDIAMTX_CONFIG", str(REPO_ROOT / "mediamtx.yml"))
     update_asset = os.environ.get("UPDATE_ASSET") or None
     allowed_origins = {o.strip().rstrip("/") for o in os.environ.get("PRINTGUARD_ORIGINS", "").split(",") if o.strip()}

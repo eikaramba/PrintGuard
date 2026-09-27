@@ -15,6 +15,7 @@ Which image to pull, how PrintGuard picks a model runtime, and how to give it a 
 - [Execution providers by platform](#execution-providers-by-platform)
 - [Intel GPU](#intel-gpu)
 - [NVIDIA GPU](#nvidia-gpu)
+- [AMD GPU (ROCm / MIGraphX)](#amd-gpu-rocm--migraphx)
 - [Reading and pinning the runtime](#reading-and-pinning-the-runtime)
 
 ## How much hardware you need
@@ -101,6 +102,7 @@ platform:
 | Older Windows, desktop app | Optimised CPU | No provider install |
 | Linux `amd64`, standard image | OpenVINO | Intel CPU path out of the box, and the GPU needs `latest-intel` and `/dev/dri` |
 | Linux `amd64`, `latest-nvidia` | TensorRT RTX | Needs the NVIDIA Container Toolkit on the host |
+| Linux `amd64`, AMD ROCm / native | MIGraphX or ROCm | Needs ROCm 7.x runtime, `onnxruntime-migraphx`, and `/dev/dri` + `/dev/kfd` |
 | Linux `arm64`, standard image | Optimised CPU | Raspberry Pi 4/5 and similar |
 
 If no accelerator is usable, ONNX Runtime falls back to its CPU provider and PrintGuard
@@ -173,6 +175,28 @@ The image asks the Container Toolkit for every GPU on the host and carries the C
 runtime the provider needs, so the toolkit is the only thing to install. To pick one card,
 set `NVIDIA_VISIBLE_DEVICES` to its UUID or index. If the toolkit cannot hand the GPU over,
 PrintGuard logs which provider is unavailable and keeps running on the CPU.
+
+## AMD GPU (ROCm / MIGraphX)
+
+AMD discrete GPUs and unified memory APUs (such as AMD Strix Halo, `gfx1151`) run through
+ONNX Runtime using the MIGraphX or ROCm execution providers.
+
+In a native Linux environment or inside an unprivileged Proxmox LXC container:
+
+1. Ensure the container has access to `/dev/dri/renderD128` and `/dev/kfd` with `gid=44`
+   (video group).
+2. Install the matching ROCm runtime packages (`rocm-core`, `migraphx`, `rocm-smi`).
+3. Install the `onnxruntime-migraphx` wheel corresponding to your ROCm release from AMD's
+   manylinux package index.
+4. For Strix Halo APUs, export `HSA_OVERRIDE_GFX_VERSION=11.5.1` and `ROCBLAS_USE_HIPBLASLT=1`.
+
+PrintGuard automatically saves compiled model execution plans to
+`ORT_MIGRAPHX_MODEL_CACHE_PATH` (defaulting to `<DATA_DIR>/cache/migraphx`), so model load is
+instantaneous after the initial compilation.
+
+When active, **compute** in the header displays `amd gpu`. If GPU libraries or device permissions
+are missing, PrintGuard logs the warning and falls back to CPU execution without interrupting
+monitoring.
 
 ## Reading and pinning the runtime
 

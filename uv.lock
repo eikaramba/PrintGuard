@@ -1265,7 +1265,7 @@ requires-dist = [
     { name = "ml-dtypes", specifier = ">=0.5.1" },
     { name = "numpy", specifier = ">=2.1" },
     { name = "nvidia-cuda-runtime-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'nvidia'", specifier = ">=12.9" },
-    { name = "onnxruntime", marker = "sys_platform != 'win32'", specifier = ">=1.24.1" },
+    { name = "onnxruntime", marker = "sys_platform != 'win32'", specifier = ">=1.23.0" },
     { name = "onnxruntime-ep-nv-tensorrt-rtx-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'nvidia'", specifier = ">=0.3.0", index = "https://pypi.nvidia.com/" },
     { name = "onnxruntime-ep-openvino", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=1.5.2" },
     { name = "onnxruntime-windowsml", marker = "sys_platform == 'win32'", specifier = ">=1.24.1" },

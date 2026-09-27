@@ -232,6 +232,8 @@ PLATFORMS: dict[str, str] = {
     "docker": "Docker",
     "docker-nvidia": "NVIDIA image",
     "docker-intel": "Intel image",
+    "docker-amd": "AMD image / LXC",
+    "linux": "Linux native / LXC",
     "macos": "macOS",
     "windows": "Windows",
 }

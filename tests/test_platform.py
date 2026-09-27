@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import json
 import struct
 import sys
@@ -12,8 +11,12 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+if sys.platform != "win32":
+    import fcntl
+
 import av
 import numpy as np
+import onnxruntime as ort
 import pytest
 
 from printguard.engine import vision
@@ -92,6 +95,72 @@ def _ep_device(
             type=SimpleNamespace(name=device_type), metadata={}, vendor_id=vendor_id, device_id=device_id
         ),
     )
+
+
+def test_amd_migraphx_provider_selected_and_named(monkeypatch, tmp_path: Path) -> None:
+    """When MIGraphXExecutionProvider is available, OnnxInference uses it and reports AMD GPU."""
+    from unittest.mock import MagicMock
+    from printguard.server.inference import OnnxInference
+
+    monkeypatch.setattr(ort, "get_ep_devices", lambda: [])
+    monkeypatch.setattr(ort, "get_available_providers", lambda: ["MIGraphXExecutionProvider", "CPUExecutionProvider"])
+
+    mock_session = MagicMock()
+    mock_session.get_providers.return_value = ["MIGraphXExecutionProvider", "CPUExecutionProvider"]
+    mock_session.get_inputs.return_value = [MagicMock(name="input")]
+    monkeypatch.setattr(ort, "InferenceSession", lambda *args, **kwargs: mock_session)
+
+    dummy_model = tmp_path / "model.onnx"
+    dummy_model.touch()
+    inference = OnnxInference(dummy_model)
+    assert inference.device == "AMD GPU"
+
+
+def test_amd_rocm_provider_selected_and_named(monkeypatch, tmp_path: Path) -> None:
+    """When ROCMExecutionProvider is available, OnnxInference uses it and reports AMD GPU."""
+    from unittest.mock import MagicMock
+    from printguard.server.inference import OnnxInference
+
+    monkeypatch.setattr(ort, "get_ep_devices", lambda: [])
+    monkeypatch.setattr(ort, "get_available_providers", lambda: ["ROCMExecutionProvider", "CPUExecutionProvider"])
+
+    mock_session = MagicMock()
+    mock_session.get_providers.return_value = ["ROCMExecutionProvider", "CPUExecutionProvider"]
+    mock_session.get_inputs.return_value = [MagicMock(name="input")]
+    monkeypatch.setattr(ort, "InferenceSession", lambda *args, **kwargs: mock_session)
+
+    dummy_model = tmp_path / "model.onnx"
+    dummy_model.touch()
+    inference = OnnxInference(dummy_model)
+    assert inference.device == "AMD GPU"
+
+
+def test_amd_provider_failure_falls_back_to_cpu(monkeypatch, tmp_path: Path) -> None:
+    """When an AMD execution provider fails to initialize, it cleanly falls back to CPU."""
+    from unittest.mock import MagicMock
+    from printguard.server.inference import OnnxInference
+
+    monkeypatch.setattr(ort, "get_ep_devices", lambda: [])
+    monkeypatch.setattr(ort, "get_available_providers", lambda: ["MIGraphXExecutionProvider", "CPUExecutionProvider"])
+
+    calls = []
+
+    def mock_create_session(model, sess_options=None, providers=None):
+        calls.append(providers)
+        if providers and "MIGraphXExecutionProvider" in providers:
+            raise RuntimeError("ROCm driver not found")
+        mock_session = MagicMock()
+        mock_session.get_providers.return_value = ["CPUExecutionProvider"]
+        mock_session.get_inputs.return_value = [MagicMock(name="input")]
+        return mock_session
+
+    monkeypatch.setattr(ort, "InferenceSession", mock_create_session)
+
+    dummy_model = tmp_path / "model.onnx"
+    dummy_model.touch()
+    inference = OnnxInference(dummy_model)
+    assert inference.device == "ONNX CPU"
+    assert len(calls) == 2
 
 
 def test_the_accelerator_a_provider_offers_wins_and_is_the_one_named() -> None:
@@ -173,6 +242,7 @@ def test_measured_concurrency_tracks_scaling() -> None:
     assert _measure_concurrency(serialises)[0] == 1
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file permissions are only enforced on Unix")
 def test_the_state_file_is_readable_only_by_whoever_runs_the_hub(tmp_path) -> None:
     """It holds printer passwords, API token hashes and plugin credentials."""
     holder = SimpleNamespace(_state_path=tmp_path / "state.json")
@@ -206,6 +276,7 @@ def _answering(monkeypatch, reply: bytes) -> None:
     monkeypatch.setattr(fcntl, "ioctl", ioctl)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="V4L2 ioctl tests require fcntl on Linux")
 def test_a_capture_node_is_offered_under_its_card_name(tmp_path: Path, monkeypatch) -> None:
     """The name a camera is registered with is the one its driver reports."""
     node = tmp_path / "video0"
@@ -215,6 +286,7 @@ def test_a_capture_node_is_offered_under_its_card_name(tmp_path: Path, monkeypat
     assert _v4l2_card(node) == "HD Pro Webcam C920"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="V4L2 ioctl tests require fcntl on Linux")
 def test_the_metadata_node_beside_a_camera_is_not_offered(tmp_path: Path, monkeypatch) -> None:
     """A USB camera registers two nodes and only one of them has any picture.
 

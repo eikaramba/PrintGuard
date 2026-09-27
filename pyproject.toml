@@ -14,7 +14,7 @@ dependencies = [
     "httpx>=0.28",
     "ml-dtypes>=0.5.1",
     "numpy>=2.1",
-    "onnxruntime>=1.24.1; sys_platform != 'win32'",
+    "onnxruntime>=1.23.0; sys_platform != 'win32'",
     "onnxruntime-ep-openvino>=1.5.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "onnxruntime-windowsml>=1.24.1; sys_platform == 'win32'",
     "packaging>=24.0",

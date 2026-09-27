@@ -14,4 +14,8 @@ web/dist-site/
 web/test-results/
 plugins/*.zip
 .claude/settings.local.json
-proxmox
+proxmox/*
+!proxmox/PRINTGUARD_LXC_HANDOFF.md
+!proxmox/create-printguard-lxc.sh
+!proxmox/install-printguard-lxc.sh
+!proxmox/update-printguard.sh

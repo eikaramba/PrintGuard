@@ -7,6 +7,19 @@ release notes.
 The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Support for AMD hardware acceleration in ONNX Runtime via MIGraphX (`MIGraphXExecutionProvider`)
+  and ROCm (`ROCMExecutionProvider`), automatically active when running on AMD GPUs and APUs
+  (such as AMD Strix Halo) with shared `/dev/dri` and `/dev/kfd` access. Compiled graph execution
+  plans are automatically cached under the data directory.
+- Native Linux and Proxmox LXC deployment support without Docker, including automated
+  container creation and native installer scripts in `proxmox/`.
+- Automatic detection of a standalone MediaMTX binary on `PATH` when `MEDIAMTX_BINARY` is not
+  explicitly exported.
+
 ## [2.5.1] - 2026-09-24
 
 ### Fixed

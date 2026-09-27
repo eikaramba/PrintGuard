@@ -24,6 +24,7 @@ from ai_edge_litert.interpreter import Interpreter
 InferenceRuntime = Literal["auto", "litert", "onnx"]
 Model = Callable[[np.ndarray], np.ndarray]
 
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 BENCHMARK_RUNS = 10
 BENCHMARK_TENSOR = np.zeros((1, 3, 224, 224), dtype=np.float32)
 SCALING_GAIN = 1.1
@@ -157,31 +158,107 @@ class OnnxInference:
         if sys.platform == "win32":
             self._register_windows_providers()
 
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = 1
         devices = _execution_devices(ort.get_ep_devices())
-        if devices:
+        available = ort.get_available_providers()
+        gpu_devices = [d for d in devices if d.device.type.name in ("GPU", "NPU")]
+
+        if "MIGraphXExecutionProvider" in available and "ORT_MIGRAPHX_MODEL_CACHE_PATH" not in os.environ:
+            cache_dir = Path(os.environ.get("DATA_DIR", REPO_ROOT / "data")) / "cache" / "migraphx"
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                os.environ["ORT_MIGRAPHX_MODEL_CACHE_PATH"] = str(cache_dir)
+            except OSError:
+                pass
+
+        self._session = None
+        if gpu_devices:
             logger.info("execution providers offer: %s", ", ".join(_device_label(device) for device in devices))
-            options.add_provider_for_devices(devices[:1], {})
-            self._session = ort.InferenceSession(str(model_path), sess_options=options)
-            self.device = _device_label(devices[0])
-        elif "CoreMLExecutionProvider" in ort.get_available_providers():
-            providers = [
-                (
-                    "CoreMLExecutionProvider",
-                    {"ModelFormat": "MLProgram", "MLComputeUnits": "ALL", "RequireStaticInputShapes": "1"},
-                ),
-                DEFAULT_CPU_PROVIDER,
-            ]
-            self._session = ort.InferenceSession(str(model_path), sess_options=options, providers=providers)
-            self.device = "Apple Core ML"
-        else:
+            try:
+                options = self._session_options()
+                options.add_provider_for_devices(gpu_devices[:1], {})
+                self._session = ort.InferenceSession(str(model_path), sess_options=options)
+                self.device = _device_label(gpu_devices[0])
+            except Exception as exc:
+                logger.warning("GPU device %s failed to initialize: %s", _device_label(gpu_devices[0]), exc)
+                self._session = None
+
+        if self._session is None:
+            if "MIGraphXExecutionProvider" in available:
+                try:
+                    options = self._session_options()
+                    self._session = ort.InferenceSession(
+                        str(model_path), sess_options=options, providers=["MIGraphXExecutionProvider", DEFAULT_CPU_PROVIDER]
+                    )
+                    active = self._session.get_providers()
+                    self.device = "AMD GPU" if active and active[0] == "MIGraphXExecutionProvider" else "ONNX CPU"
+                except Exception as exc:
+                    logger.warning("MIGraphX execution provider failed: %s", exc)
+                    self._session = None
+            elif "ROCMExecutionProvider" in available:
+                try:
+                    options = self._session_options()
+                    self._session = ort.InferenceSession(
+                        str(model_path), sess_options=options, providers=["ROCMExecutionProvider", DEFAULT_CPU_PROVIDER]
+                    )
+                    active = self._session.get_providers()
+                    self.device = "AMD GPU" if active and active[0] == "ROCMExecutionProvider" else "ONNX CPU"
+                except Exception as exc:
+                    logger.warning("ROCm execution provider failed: %s", exc)
+                    self._session = None
+            elif "CUDAExecutionProvider" in available:
+                try:
+                    options = self._session_options()
+                    self._session = ort.InferenceSession(
+                        str(model_path), sess_options=options, providers=["CUDAExecutionProvider", DEFAULT_CPU_PROVIDER]
+                    )
+                    active = self._session.get_providers()
+                    self.device = "NVIDIA GPU" if active and active[0] == "CUDAExecutionProvider" else "ONNX CPU"
+                except Exception as exc:
+                    logger.warning("CUDA execution provider failed: %s", exc)
+                    self._session = None
+            elif "CoreMLExecutionProvider" in available:
+                providers = [
+                    (
+                        "CoreMLExecutionProvider",
+                        {"ModelFormat": "MLProgram", "MLComputeUnits": "ALL", "RequireStaticInputShapes": "1"},
+                    ),
+                    DEFAULT_CPU_PROVIDER,
+                ]
+                try:
+                    options = self._session_options()
+                    self._session = ort.InferenceSession(str(model_path), sess_options=options, providers=providers)
+                    self.device = "Apple Core ML"
+                except Exception as exc:
+                    logger.warning("Core ML execution provider failed: %s", exc)
+                    self._session = None
+
+        if self._session is None:
+            cpu_devices = [d for d in devices if d.device.type.name == "CPU"]
+            if cpu_devices:
+                logger.info("execution providers offer: %s", ", ".join(_device_label(device) for device in cpu_devices))
+                try:
+                    options = self._session_options()
+                    options.add_provider_for_devices(cpu_devices[:1], {})
+                    self._session = ort.InferenceSession(str(model_path), sess_options=options)
+                    self.device = _device_label(cpu_devices[0])
+                except Exception as exc:
+                    logger.warning("CPU device %s failed to initialize: %s", _device_label(cpu_devices[0]), exc)
+                    self._session = None
+
+        if self._session is None:
+            options = self._session_options()
             self._session = ort.InferenceSession(
                 str(model_path), sess_options=options, providers=[DEFAULT_CPU_PROVIDER]
             )
             self.device = "ONNX CPU"
 
         self._input_name = self._session.get_inputs()[0].name
+
+    @staticmethod
+    def _session_options() -> ort.SessionOptions:
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        return options
 
     def _register_plugins(self) -> None:
         _preload_cuda_runtime()
