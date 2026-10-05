@@ -38,7 +38,8 @@ channels.
 ## Register a printer
 
 Open the printer registry, choose the service, fill in the form and press **Test connection**
-before saving. Then bind it to a monitor and choose whether a sustained defect alerts you, pauses the
+before saving. A printer with a starred field left blank is not saved, and the error names the
+field. Then bind it to a monitor and choose whether a sustained defect alerts you, pauses the
 print or cancels it.
 
 Linked printers report job name, progress, temperatures and state on every monitor that uses
@@ -65,7 +66,7 @@ Bambu printers speak MQTT over TLS rather than HTTP.
 
 1. On the printer, enable **LAN Only Mode**, then **Developer Mode** under
    Network in Settings. This opens the MQTT channel.
-2. Note the **access code** shown there, and the **serial number** under Device in Settings.
+2. Note the access code shown there, and the serial number under Device in Settings.
 3. Register the printer with its IP address, serial number and access code.
 
 The chamber camera is registered automatically: RTSP on the X1 and H2 series, or the
@@ -90,6 +91,9 @@ local protocol the printer speaks and registers its chamber camera automatically
 - Carbon 2: enable **LAN Only Mode** in its network settings and use the access code shown
   there.
 - Original Carbon: the IP address is enough.
+
+While a Carbon 2 starts up, loads or unloads filament, levels or calibrates outside a print,
+PrintGuard shows its state as unknown and a monitor stays as it was.
 
 **Neptune/OrangeStorm** covers the Neptune 4 Pro, Plus and Max, the OrangeStorm Giga, and
 any other Elegoo printer running Moonraker. PrintGuard uses the stock Moonraker service on
@@ -127,7 +131,9 @@ Each one opens in a panel that draws its toolpath on your device before
 the file is uploaded, where you can name it, tag it and correct its first layer nozzle and bed
 temperatures. The panel sends the start and end of the file to the hub to read its print time,
 filament and temperatures. Every other print temperature the slicer set moves by the same amount, while the
-temperatures a start gcode probes or wipes at stay put. A file whose slicer lists no print
+temperatures a start gcode probes or wipes at stay put. A file sliced with several filaments shows
+the one its first layer prints with and moves only that filament's temperatures, and nothing moves
+past 350°C on the nozzle or 150°C on the bed. A file whose slicer lists no print
 temperatures has every one of its set-points moved. Binary gcode keeps the temperatures it
 was sliced with.
 
@@ -140,7 +146,8 @@ instead. Open a file to orbit its toolpath in 3D, layer by layer.
 
 Tag a file with the printers it was sliced for and it can only start on one of those. A tag is
 only offered for a printer whose service takes the format. A file
-with no tags can go to any printer whose service takes the format. Either way the printer has to
+with no tags can go to any printer whose service takes the format. Remove a printer and the files
+tagged only for it stay tagged, so they start nowhere until you tag them for another. Either way the printer has to
 report idle at the moment you press **Print**, so nothing lands on top of a running job.
 
 | Service | Takes | How it starts |
@@ -157,14 +164,19 @@ failed print.
 A file is sent under its library name, cut to 60 characters with anything outside plain letters,
 digits, dots and dashes turned into `_`. Rename it first if the printer's own file list matters
 to you. PrusaLink replaces a file of the same name already on the printer. A file can be up to
-512 MB. Binary gcode has no 3D view and no drawn preview, since its toolpath is
+512 MB. A file whose gcode is over 32 MB isn't drawn in the browser, since parsing it takes
+about nine times its size in memory, so it has no 3D view and no drawn preview. It uploads and
+prints as usual, and the hub still reads its print time, filament and temperatures. A smaller
+file the browser can't draw, such as on a device with no WebGL, uploads without a drawn preview
+too. Binary gcode has no 3D view and no drawn preview, since its toolpath is
 compressed, so it shows the preview PrusaSlicer embedded and nothing else. Its print time and filament can
 be blank too, where PrusaSlicer compressed them.
 
 A Bambu print uses the settings sliced into the file, with bed levelling on, flow and vibration
-calibration off, and filament from the external spool or the first AMS slot. Starting a 3mf
+calibration off, and filament from the external spool, not an AMS. Starting a 3mf
 needs Developer Mode, the same switch the MQTT connection needs. A project exported without its
-gcode is refused at upload.
+gcode is refused at upload. A Bambu printer keeps reporting a cancelled or failed job as failed until
+the next one starts, which PrintGuard shows as idle, so clear the bed before you press **Print**.
 
 Files live in the data directory under `prints/`, so they survive a restart and travel with the
 `/data` volume.
@@ -186,14 +198,40 @@ heater off.
 | Bambu Lab | Yes | Yes, as the `M104` and `M140` lines Bambu Studio sends |
 
 A target is capped at 350 °C for the nozzle and 150 °C for the bed, and the printer's own
-firmware applies its limits on top. Temperatures refresh with the printer's state, every five
-seconds.
+firmware applies its limits on top. Temperatures refresh with the printer's state, about every
+five seconds. Printers are read together, so the gap grows to about fifteen seconds while one of
+them isn't answering.
 
 ## Networking caveats
 
 The hub makes every request to a print service itself, so the address you register has to be
 one the hub can reach, not one your browser can. The browser never calls the printer, so an
 `http://` printer works from a hub you open over HTTPS.
+
+Register the address the service answers on, not one that redirects to it. A proxy that answers
+`http://` with a 301 or 302 to `https://` turns a pause into a read, so PrintGuard reports the
+command as failed and names the address to use. A 307 or 308 keeps the command and is followed.
+
+### Where a printer's webcam is read from
+
+OctoPrint and Moonraker usually report their webcam as a path such as `/webcam/?action=stream`,
+which their own web interface resolves against the address it's served on. PrintGuard does the
+same from the address you registered:
+
+| Registered address | Webcam is read from |
+|---|---|
+| Moonraker's own port, `7125` to `7199`, such as `http://pi.lan:7126` for a second instance | The same host on the default port, `http://pi.lan/webcam2/?action=stream` |
+| OctoPrint's own port, `http://octopi.local:5000` | The same host on the default port, `http://octopi.local/webcam/?action=stream` |
+| Any other port, such as a reverse proxy on `http://nas.lan:8080` | That port, `http://nas.lan:8080/webcam/?action=stream` |
+| No port | The same address |
+
+An OctoPrint container published as `5000:80` can't be told apart from OctoPrint's own port, so
+its webcam is looked for on port 80. Publish it on another port, or set an absolute stream URL
+in OctoPrint's webcam settings, which is used as it is.
+
+A Moonraker webcam set to the MediaMTX or go2rtc WebRTC service is pulled from that server's
+WHEP endpoint. One set to camera-streamer is read from its MJPEG stream, since camera-streamer
+has no WHEP endpoint.
 
 ### Running in Docker
 

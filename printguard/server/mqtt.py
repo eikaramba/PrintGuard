@@ -293,12 +293,18 @@ class MqttBridge:
     The bridge subscribes to engine events as a transport sink, draining them
     through a queue so the synchronous sink never blocks the engine, and keeps
     one ``aiomqtt`` session alive while the bridge is enabled, reconnecting on
-    failure and on a settings change.
+    failure and on a settings change. An outage raises one warning when it
+    starts or its cause changes and one when the broker is back, because a
+    warning per attempt would push every alert out of the engine's recent events.
 
     The broker only publishes the last will when a connection drops, so a
     session the bridge ends itself says ``offline`` first. The client id is
     random per bridge because a broker gives a session to the newest client
     using an id, and a process id is 1 in every container.
+
+    Everything a monitor is announced by is retained, so the broker keeps it
+    until it is cleared. The monitors announced are remembered from one session
+    to the next for that, since one can be removed while the broker is away.
     """
 
     def __init__(self, engine: "Engine", get_config: Callable[[], dict[str, Any]]) -> None:
@@ -311,6 +317,7 @@ class MqttBridge:
         self._state: dict[str, Any] = {}
         self._task: asyncio.Task | None = None
         self._client_id = f"printguard-{secrets.token_hex(4)}"
+        self._outage: str | None = None
 
     def start(self) -> None:
         """Launches the connection loop, which idles until the bridge is configured."""
@@ -329,6 +336,7 @@ class MqttBridge:
         while True:
             config = self._get_config()
             if not bridge_enabled(config):
+                self._outage = None
                 await asyncio.sleep(RECONNECT_DELAY_S)
                 continue
             try:
@@ -336,7 +344,10 @@ class MqttBridge:
             except _Reconnect:
                 continue
             except Exception as exc:
-                self._engine.emit({"event": "warning", "message": f"Home Assistant MQTT unavailable: {exc}", "recovered": False})
+                outage = f"Home Assistant MQTT unavailable: {exc}"
+                if outage != self._outage:
+                    self._outage = outage
+                    self._engine.emit({"event": "warning", "message": outage, "recovered": False})
                 await asyncio.sleep(RECONNECT_DELAY_S)
 
     async def _session(self, config: dict[str, Any]) -> None:
@@ -356,9 +367,11 @@ class MqttBridge:
         ) as client:
             self._published.clear()
             self._reported.clear()
-            self._devices.clear()
             self._state = {}
             logger.info("Home Assistant MQTT bridge connected to %s", config["host"])
+            if self._outage is not None:
+                self._outage = None
+                self._engine.emit({"event": "warning", "message": "Home Assistant MQTT reconnected", "recovered": True})
             await client.publish(status_topic(base), "online", qos=1, retain=True)
             await client.subscribe(f"{base}/monitor/+/+/set", qos=1)
             self._engine.add_sink(self._sink)
@@ -421,7 +434,8 @@ class MqttBridge:
             await self._publish(client, device_config_topic(prefix, monitor_id), json.dumps(discovery_config(monitor, printer, version, base)))
             await self._publish_state(client, monitor_id, base)
         for monitor_id in self._devices - desired:
-            await client.publish(device_config_topic(prefix, monitor_id), "", qos=1, retain=True)
+            for topic in (device_config_topic(prefix, monitor_id), state_topic(base, monitor_id), snapshot_topic(base, monitor_id)):
+                await client.publish(topic, "", qos=1, retain=True)
             self._published.pop(device_config_topic(prefix, monitor_id), None)
             self._reported.pop(monitor_id, None)
         self._devices = desired

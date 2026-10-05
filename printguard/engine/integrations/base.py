@@ -12,7 +12,7 @@ from __future__ import annotations
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Container
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from ..adapters import Adapter, HttpFn
@@ -115,10 +115,14 @@ class IntegrationAdapter(Adapter):
         heater_control: Whether the service takes heater targets through
             ``heat()``. Every service reports the temperatures it has; this is
             about setting them, which is off by default.
+        slow_action_s: Seconds the service can hold an action or a heater
+            target before answering, on top of an ordinary request. A caller
+            waiting on a command gives it that much longer.
     """
 
     formats: tuple[str, ...] = ()
     heater_control: bool = False
+    slow_action_s: float = 0.0
 
     def meta(self) -> dict[str, Any]:
         """Serialises adapter metadata, with the formats it prints and whether it heats."""
@@ -195,22 +199,36 @@ class IntegrationAdapter(Adapter):
         """
         raise RuntimeError(f"{self.label} cannot receive print files")
 
+    def connection_key(self, config: dict[str, Any]) -> Any:
+        """Identifies the persistent connection a configuration is served by.
+
+        Args:
+            config: User-supplied values matching the adapter schema.
+
+        Returns:
+            A value equal for two configurations that share one connection,
+            so closing either closes it for both. The default is the whole
+            configuration.
+        """
+        return config
+
     async def close(self, config: dict[str, Any] | None = None) -> None:
         """Releases persistent connections for one configuration or all configurations."""
 
 
-def webcam_url(base_url: str, stream: str, api_port: int) -> str:
-    """Resolves the webcam URL a service reports against the service's host.
+def webcam_url(base_url: str, stream: str, api_ports: Container[int]) -> str:
+    """Resolves the webcam URL a service reports against the address its web interface is served on.
 
     Moonraker and OctoPrint report a relative path (``/webcam/?action=stream``)
-    as served on the host's web port. Their own API ports (7125, 5000) route
-    no webcam path, so a base URL on that port is joined as the bare host. Any
-    other port is the web server or a proxy in front of it and is kept.
+    for their web interface to resolve against its own origin. A base URL on
+    one of the service's own API ports routes no webcam path, so it is joined
+    on the scheme's default port, where that web interface is. Any other port
+    is the web server or a proxy in front of it and is kept.
 
     Args:
         base_url: The service's configured API address.
         stream: The stream URL the service reports.
-        api_port: The port the service's API listens on by default.
+        api_ports: The ports the service's own API listens on.
 
     Returns:
         The stream URL, an absolute one unchanged.
@@ -218,5 +236,5 @@ def webcam_url(base_url: str, stream: str, api_port: int) -> str:
     if urlsplit(stream).scheme:
         return stream
     host = urlsplit(base_url)
-    netloc = host.hostname or "" if host.port == api_port else host.netloc
+    netloc = host.netloc.rpartition(":")[0] if host.port in api_ports else host.netloc
     return urljoin(urlunsplit((host.scheme, netloc, "", "", "")), stream)

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
 import numpy as np
+import websockets
 
-from printguard.engine.platform import Frame
+from printguard.engine.platform import Frame, Notice
 
 
 class FakeSource:
@@ -52,6 +54,29 @@ class FakeSocket:
         self.arrived("closed", "")
 
 
+@asynccontextmanager
+async def redirected_socket() -> AsyncIterator[tuple[str, list[str]]]:
+    """Serves a WebSocket address on loopback that redirects to a second one.
+
+    Yields:
+        The address that redirects, and the path of every handshake that
+        reached the address it points at.
+    """
+    reached: list[str] = []
+
+    async def elsewhere(connection: websockets.ServerConnection) -> None:
+        reached.append(connection.request.path)
+
+    async with websockets.serve(elsewhere, "127.0.0.1", 0) as target:
+        def redirect(connection: websockets.ServerConnection, request: Any) -> Any:
+            response = connection.respond(302, "")
+            response.headers["Location"] = f"ws://127.0.0.1:{target.sockets[0].getsockname()[1]}/api/ws"
+            return response
+
+        async with websockets.serve(elsewhere, "127.0.0.1", 0, process_request=redirect) as declared:
+            yield f"ws://127.0.0.1:{declared.sockets[0].getsockname()[1]}", reached
+
+
 class FakeFileStore:
     """In-memory print file store."""
 
@@ -69,6 +94,7 @@ class FakeFileStore:
         return self.blobs[key]
 
     async def remove(self, key: str) -> None:
+        await asyncio.sleep(0)
         self.blobs.pop(key, None)
 
 
@@ -103,10 +129,15 @@ class FakePlatform:
         self.state: dict[str, Any] = {}
         self.inference_runtime = "auto"
         self.files = FakeFileStore()
+        self.notices: list[Notice] = []
 
     async def configure(self, settings: dict[str, Any]) -> None:
         """Records the selected inference runtime."""
         self.inference_runtime = settings["inference_runtime"]
+
+    def take_notices(self) -> list[Notice]:
+        notices, self.notices = self.notices, []
+        return notices
 
     async def infer(self, rgb: np.ndarray) -> dict[str, Any]:
         self.inference_started.set()
@@ -120,6 +151,8 @@ class FakePlatform:
         return list(self.devices)
 
     async def open_camera(self, camera_id: str, source: dict[str, Any]) -> FakeSource:
+        if source["kind"] == "device" and source["device_id"] not in [device["device_id"] for device in self.devices]:
+            raise OSError(f"no device at {source['device_id']}")
         return FakeSource(float(source.get("fps", 15.0)))
 
     async def release_camera(self, camera_id: str, source: dict[str, Any]) -> None:

@@ -57,7 +57,8 @@ The Plugins tab in Settings lists what you have installed and what the catalogue
 
 ![The Spotify plugin's page in the store, with its screenshot, its README and the permissions it will ask for](assets/plugin-page.png)
 
-Every installed plugin has the same page, opened from its card.
+Every installed plugin has the same page, opened from its card. A README is shown as Markdown
+only, so any HTML in it beyond text, links, images, tables and code is dropped.
 
 The catalogue is filtered by where your hub runs, and an install from a repository or a zip is
 refused if the plugin names other platforms.
@@ -94,7 +95,8 @@ A repository install pins the commit it resolved to. **Update** re-resolves the 
 installed from, or the default branch if it had none, and re-checks the hashes.
 
 An update that asks for more stands the plugin down until you accept the wider list. More means
-a permission, an address or another plugin it calls.
+a permission, an address, another plugin it calls or a different sign-in address. A different
+sign-in address also signs the plugin out.
 
 | Installed over | Grants, stored data and credentials |
 |---|---|
@@ -155,18 +157,34 @@ A plugin has up to three files, and each runs in a sandbox.
 |---|---|
 | `plugin.js` | A hidden iframe in the dashboard, with an opaque origin and `default-src 'none'` |
 | `panel.html` | A visible iframe with the same origin rules, where its own markup, styles and scripts are allowed |
+
+The dashboard lets a frame load only from the hub and removes one that loads anything a second
+time, so a plugin that sends its frame elsewhere is stopped with "sandbox navigated away".
 | `worker.js` | [QuickJS](https://github.com/quickjs-ng/quickjs) compiled to WebAssembly on the hub, under wasmtime |
 
 | Attack | What stops it |
 |---|---|
-| Take your credentials somewhere | Neither sandbox has sockets. The browser files' policy is `connect-src 'none'`, and the hub file has no WASI network and no filesystem. The only way out is a request through PrintGuard, to addresses the plugin declared. A redirect is handed back to the plugin and never followed |
+| Take your credentials somewhere | Neither sandbox has sockets. The browser files' policy is `connect-src 'none'`, WebRTC is removed from their frames, and the hub file has no WASI network and no filesystem. The only request out is one through PrintGuard, to addresses the plugin declared. A redirect is never followed, by a request or by a WebSocket. [What a browser still allows](#what-a-browser-still-allows) is below |
 | Read your credentials at all | State is cut down to the fields a permission names. Printer configuration, notifier settings, MQTT credentials and API tokens are in no permission. The exceptions are `routes` and `gate`, which see the cookie and authorisation headers of the requests they answer |
 | Read your camera frames | A camera in a plugin's panel is a placeholder PrintGuard fills with its own player, and the video never enters the sandbox. Reading the picture itself is `camera:frames`, which is its own thing to agree to, and a plugin's own pages are refused the live stream |
-| Hang or exhaust the hub | The worker runs against a memory cap, a CPU budget and a 5 second limit per call. A plugin that fails is disabled and reported |
+| Hang or exhaust the hub | The worker runs each call against a memory cap and a CPU budget, and a call that waits more than 5 seconds to start is dropped. A plugin that fails, or answers with anything but its data and a list of effects, is disabled and reported |
 | Open the hub by breaking its own gate | A plugin holding `gate` that fails refuses every request until you enable it again, reinstall it or remove it |
 | Do something it was not granted | Every command maps to a permission, checked at the sandbox edge before it goes anywhere |
 | Pretend to be PrintGuard | A `plugin.js` has no styling and no markup of its own, and PrintGuard draws what it describes with its own components. A `panel.html` does draw itself, inside a panel carrying the plugin's name. A plugin's own pages are served into a sandboxed origin that is not the dashboard's |
 | Change after review | The manifest and every source file are pinned by SHA-256 at a commit |
+
+### What a browser still allows
+
+The two frames and a plugin's own pages are held by the browser's own rules, and those rules leave three things open.
+
+| Still possible | What it carries |
+|---|---|
+| A frame sends itself to another address on your hub | One request, to the hub. The dashboard removes the frame as soon as the page loads |
+| A frame asks Safari to connect ahead to a host, with `<link rel="preconnect">` | No request and no body. The hostname is the plugin's to choose, so a few bytes can leave in the lookup |
+| A page the plugin serves under `/plugins/<id>/` sends your browser to another site, or opens a WebRTC connection | Whatever the plugin's worker put in that page, in the address it goes to. The page loads nothing from another host and makes no request of its own, but it is a tab like any other, and no policy stops a tab leaving. `routes` is the permission that allows it |
+
+The frame and page rules are tested in Chromium and in WebKit, which is Safari's engine. Firefox is not
+in the test run.
 
 ## Credentials
 

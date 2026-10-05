@@ -3,25 +3,34 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
+import logging
+import socket
 import struct
 import sys
 import threading
 import time
+from contextlib import ExitStack
+from fractions import Fraction
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 if sys.platform != "win32":
     import fcntl
 
 import av
+import httpx
 import numpy as np
 import onnxruntime as ort
 import pytest
+import websockets
+from fakes import redirected_socket
 
 from printguard.engine import vision
 from printguard.server.inference import (
     Inference,
+    OnnxInference,
     _device_label,
     _execution_devices,
     _measure_concurrency,
@@ -30,7 +39,9 @@ from printguard.server.inference import (
 from printguard.server.platform import (
     V4L2_CAP_DEVICE_CAPS,
     V4L2_CAP_VIDEO_CAPTURE,
+    V4L2_OPEN_OPTIONS,
     AVSource,
+    DiskFileStore,
     ServerPlatform,
     _v4l2_card,
     _video_devices,
@@ -146,7 +157,7 @@ def test_amd_provider_failure_falls_back_to_cpu(monkeypatch, tmp_path: Path) -> 
 
     calls = []
 
-    def mock_create_session(model, sess_options=None, providers=None):
+    def mock_create_session(model, sess_options=None, providers=None, **kwargs):
         calls.append(providers)
         if providers and "MIGraphXExecutionProvider" in providers:
             raise RuntimeError("ROCm driver not found")
@@ -199,17 +210,66 @@ def test_windows_software_adapter_is_never_handed_to_directml() -> None:
 def test_windows_device_listing_ends_without_failing_the_hub(monkeypatch: pytest.MonkeyPatch) -> None:
     """A hub on Windows must start whether or not a camera is plugged in.
 
-    DirectShow ends every device listing with FFmpeg's immediate exit, which PyAV
+    DirectShow can end a device listing with FFmpeg's immediate exit, which PyAV
     raises as an error of its own rather than an ``OSError``.
     """
 
-    def list_devices(*_args: object, **_kwargs: object) -> None:
+    def list_devices(_format: str) -> list[object]:
         raise av.error.ExitError(1414092869, "Immediate exit requested")
 
     monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr(av, "open", list_devices)
+    monkeypatch.setattr(av.device, "enumerate_input_devices", list_devices)
 
     assert _video_devices() == []
+
+
+def test_windows_lists_its_cameras_by_device_path_and_leaves_out_microphones(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """DirectShow reports cameras and microphones together, each under a name and a device path.
+
+    What it reported is logged at debug, so one run on a PC shows whether the
+    listing matches what this expects of it.
+    """
+    devices = [
+        SimpleNamespace(name="@device_pnp_usb#vid_046d", description="HD Pro Webcam C920", media_types=["video"]),
+        SimpleNamespace(name="@device_cm_wave", description="Microphone (HD Pro Webcam C920)", media_types=["audio"]),
+    ]
+    asked: list[str] = []
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(av.device, "enumerate_input_devices", lambda name: asked.append(name) or devices)
+
+    with caplog.at_level(logging.DEBUG, logger="printguard.server.platform"):
+        assert _video_devices() == [("@device_pnp_usb#vid_046d", "HD Pro Webcam C920")]
+    assert asked == ["dshow"]
+    assert "@device_cm_wave" in caplog.text and "HD Pro Webcam C920" in caplog.text
+
+
+def test_two_windows_cameras_of_one_model_are_two_devices(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Listed by the name they share, the second vanished and would have opened the first anyway."""
+    devices = [
+        SimpleNamespace(name="@device_pnp_usb#vid_046d&mi_00#6", description="HD Pro Webcam C920", media_types=["video"]),
+        SimpleNamespace(name="@device_pnp_usb#vid_046d&mi_00#7", description="HD Pro Webcam C920", media_types=["video"]),
+    ]
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(av.device, "enumerate_input_devices", lambda name: devices)
+
+    assert _video_devices() == [
+        ("@device_pnp_usb#vid_046d&mi_00#6", "HD Pro Webcam C920 (1)"),
+        ("@device_pnp_usb#vid_046d&mi_00#7", "HD Pro Webcam C920 (2)"),
+    ]
+
+
+def test_macos_opens_a_camera_by_the_name_it_shows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AVFoundation's other name is a position in the list, which moves when a camera is plugged in."""
+    devices = [
+        SimpleNamespace(name="0", description="FaceTime HD Camera", media_types=["video"]),
+        SimpleNamespace(name="1", description="Capture screen 0", media_types=["video"]),
+    ]
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(av.device, "enumerate_input_devices", lambda name: devices)
+
+    assert _video_devices() == [("FaceTime HD Camera", "FaceTime HD Camera")]
 
 
 def test_provider_library_that_cannot_load_leaves_the_cpu(tmp_path: Path) -> None:
@@ -220,6 +280,83 @@ def test_provider_library_that_cannot_load_leaves_the_cpu(tmp_path: Path) -> Non
     otherwise take PrintGuard down at startup rather than watching printers on the CPU.
     """
     assert _register_library("printguard_test_provider", str(tmp_path / "libmissing.so")) is False
+
+
+@pytest.mark.parametrize(("runtime", "fault"), [("auto", "build"), ("onnx", "build"), ("onnx", "run")])
+async def test_an_accelerator_that_cannot_run_the_model_loses_to_the_cpu(
+    monkeypatch: pytest.MonkeyPatch, runtime: str, fault: str
+) -> None:
+    """A GPU that is offered but cannot compile or run the model must not stop the hub starting.
+
+    What was passed over is kept for the dashboard, whichever runtime wins.
+
+    The setting that picked the runtime is only reachable from a running hub, so a
+    start that fails here leaves editing the state file as the way back.
+    """
+    real_session = ort.InferenceSession
+
+    def refuse(*_: object) -> None:
+        raise RuntimeError("the GPU ran out of memory")
+
+    def session(path: str, sess_options: object = None, providers: object = None, **kwargs: object) -> object:
+        if providers is not None:
+            return real_session(path, sess_options=sess_options, providers=providers, **kwargs)
+        if fault == "build":
+            raise RuntimeError("the GPU could not compile the model")
+        return SimpleNamespace(get_inputs=lambda: [SimpleNamespace(name="input")], run=refuse)
+
+    monkeypatch.setattr(ort, "get_ep_devices", lambda: [_ep_device("OpenVINOExecutionProvider", "Intel", "GPU", {})])
+    monkeypatch.setattr(ort.SessionOptions, "add_provider_for_devices", lambda *_: None)
+    monkeypatch.setattr(ort, "InferenceSession", session)
+
+    inference = Inference(Path("models"), runtime)
+    embedding = await inference.run(np.zeros((1, 3, 224, 224), dtype=np.float32))
+    inference.close()
+
+    reason = "could not compile the model" if fault == "build" else "ran out of memory"
+    assert inference.device in ("ONNX CPU", "LiteRT CPU" if runtime == "auto" else "ONNX CPU")
+    assert embedding.shape == (1024,)
+    assert inference.skipped == [f"Intel GPU cannot run the model, so detection is not using it: the GPU {reason}"]
+
+
+def test_a_windows_provider_that_cannot_be_installed_is_left_out(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Windows ML downloads its providers on first launch, and a failed download must not stop the app."""
+
+    def unreachable() -> None:
+        raise OSError("the Store could not be reached")
+
+    provider = SimpleNamespace(
+        name="OpenVINOExecutionProvider",
+        ready_state="absent",
+        ensure_ready_async=lambda: SimpleNamespace(get=unreachable),
+    )
+    catalogue = SimpleNamespace(find_all_providers=lambda: [provider])
+    modules = {
+        "winui3.microsoft.windows.applicationmodel.dynamicdependency.bootstrap": {"initialize": ExitStack},
+        "winui3.microsoft.windows.ai.machinelearning": {
+            "ExecutionProviderCatalog": SimpleNamespace(get_default=lambda: catalogue),
+            "ExecutionProviderReadyState": SimpleNamespace(READY="ready"),
+        },
+    }
+    for name, members in modules.items():
+        parts = name.split(".")
+        for depth in range(1, len(parts) + 1):
+            package = sys.modules.get(".".join(parts[:depth])) or ModuleType(".".join(parts[:depth]))
+            monkeypatch.setitem(sys.modules, package.__name__, package)
+            if depth > 1:
+                monkeypatch.setattr(sys.modules[".".join(parts[: depth - 1])], parts[depth - 1], package, raising=False)
+        for member, value in members.items():
+            monkeypatch.setattr(sys.modules[name], member, value, raising=False)
+    monkeypatch.setattr(sys, "getwindowsversion", lambda: SimpleNamespace(build=26100), raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="printguard.server.inference"):
+        OnnxInference._register_windows_providers(SimpleNamespace(_resources=ExitStack()))
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "execution provider OpenVINOExecutionProvider could not be installed: the Store could not be reached"
+    ]
 
 
 def test_measured_concurrency_tracks_scaling() -> None:
@@ -253,6 +390,23 @@ def test_the_state_file_is_readable_only_by_whoever_runs_the_hub(tmp_path) -> No
     assert not (tmp_path / "state.tmp").exists(), "the temporary file was left behind"
 
 
+def test_the_state_file_is_never_readable_by_anyone_else_while_it_is_written(tmp_path, monkeypatch) -> None:
+    """The temporary file holds every secret from the first byte, not only once it is renamed.
+
+    One a killed hub left behind keeps the mode it had, so it is held to the
+    mode as well as created with it.
+    """
+    modes: list[str] = []
+    monkeypatch.setattr("printguard.server.platform.os.fsync", lambda descriptor: modes.append(oct((tmp_path / "state.tmp").stat().st_mode)[-3:]))
+    holder = SimpleNamespace(_state_path=tmp_path / "state.json")
+    ServerPlatform.save_state(holder, {"printers": [{"config": {"password": "hunter2"}}]})
+    (tmp_path / "state.tmp").write_text("left by a hub that was killed")
+    (tmp_path / "state.tmp").chmod(0o644)
+    ServerPlatform.save_state(holder, {"printers": []})
+
+    assert modes == ["600", "600"]
+
+
 def test_the_state_file_reaches_the_disk_before_it_takes_the_name(tmp_path, monkeypatch) -> None:
     """A rename without a sync can survive a power cut pointing at an empty file."""
     synced: list[int] = []
@@ -278,6 +432,46 @@ def test_a_damaged_state_file_is_kept_rather_than_overwritten(tmp_path, caplog) 
     assert "state.json.corrupt" in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("answer", "reached", "outcome"),
+    [
+        ("301 Moved Permanently", ["GET"], "drops the POST"),
+        ("302 Found", ["GET"], "drops the POST"),
+        ("307 Temporary Redirect", ["POST"], 204),
+        ("308 Permanent Redirect", ["POST"], 204),
+    ],
+)
+async def test_a_redirect_never_turns_a_command_into_a_read(answer: str, reached: list[str], outcome: str | int) -> None:
+    """httpx replays a POST answered with 301 or 302 as a GET, which OctoPrint answers 200 while the print carries on."""
+    arrived: list[str] = []
+
+    async def printer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        arrived.append((await reader.readuntil(b"\r\n\r\n")).split()[0].decode())
+        writer.write(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    async def proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(f"HTTP/1.1 {answer}\r\nLocation: {moved}/api/job\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".encode())
+        await writer.drain()
+        writer.close()
+
+    async with await asyncio.start_server(printer, "127.0.0.1", 0) as behind, await asyncio.start_server(proxy, "127.0.0.1", 0) as front:
+        moved = f"http://127.0.0.1:{behind.sockets[0].getsockname()[1]}"
+        registered = f"http://127.0.0.1:{front.sockets[0].getsockname()[1]}"
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            holder = SimpleNamespace(_client=client)
+            if isinstance(outcome, int):
+                assert (await ServerPlatform.http(holder, "POST", f"{registered}/api/job", json={"command": "pause"}))[0] == outcome
+            else:
+                with pytest.raises(RuntimeError, match=f"{registered} redirects to {moved}, which {outcome}"):
+                    await ServerPlatform.http(holder, "POST", f"{registered}/api/job", json={"command": "pause"})
+            assert (await ServerPlatform.http(holder, "GET", f"{registered}/api/job"))[0] == 204
+            assert (await ServerPlatform.http(holder, "POST", f"{registered}/api/job", follow_redirects=False))[0] == int(answer[:3])
+    assert arrived == [*reached, "GET"]
+
+
 def test_a_camera_that_will_not_open_keeps_its_password_out_of_the_error() -> None:
     """PyAV quotes the address it failed on, and that text becomes an error event."""
     source = AVSource("http://admin:CAMPASS@127.0.0.1:9/video?user=admin&pwd=QUERYPASS", None)
@@ -290,6 +484,218 @@ def test_a_camera_that_will_not_open_keeps_its_password_out_of_the_error() -> No
 
     assert source.last_error and "127.0.0.1:9/video" in source.last_error
     assert "CAMPASS" not in source.last_error and "QUERYPASS" not in source.last_error
+
+
+class _MjpegPipe:
+    """A healthy MJPEG camera read as a byte stream, as a Bambu A1's is."""
+
+    opened = 0
+    frame_every_s = 0.03
+
+    def __init__(self) -> None:
+        type(self).opened += 1
+        codec = av.CodecContext.create("mjpeg", "w")
+        codec.width, codec.height, codec.pix_fmt, codec.time_base = 320, 240, "yuvj420p", Fraction(1, 30)
+        picture = av.VideoFrame.from_ndarray(np.zeros((240, 320, 3), dtype=np.uint8), format="rgb24")
+        encoded = codec.encode(picture.reformat(format="yuvj420p", threads=1)) + codec.encode(None)
+        self._jpeg = b"".join(bytes(packet) for packet in encoded)
+        self._unread = b""
+        self._closed = False
+
+    def read(self, size: int = -1) -> bytes:
+        if self._closed:
+            return b""
+        if not self._unread:
+            time.sleep(self.frame_every_s)
+            self._unread = self._jpeg
+        out, self._unread = self._unread[:size], self._unread[size:]
+        return out
+
+    def close(self) -> None:
+        self._closed = True
+
+
+async def test_a_live_view_that_cannot_publish_leaves_detection_running(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """MediaMTX being down, or another program holding its port, costs the live view and nothing else."""
+    with socket.socket() as unused:
+        unused.bind(("127.0.0.1", 0))
+        refusing = f"rtsp://127.0.0.1:{unused.getsockname()[1]}/cam1"
+    publishes: list[str] = []
+    real_open = av.open
+
+    def spy(file: object, *args: object, **kwargs: object) -> object:
+        if file == refusing:
+            publishes.append(file)
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(av, "open", spy)
+    monkeypatch.setattr("printguard.server.platform.RECONNECT_DELAY_S", 0.3)
+    monkeypatch.setattr(_MjpegPipe, "opened", 0)
+    reported: list[tuple[str, bool]] = []
+
+    source = AVSource(_MjpegPipe, refusing, report=lambda message, recovered: reported.append((message, recovered)))
+    try:
+        deadline = time.monotonic() + 15
+        while len(publishes) < 3 and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        online = source.online
+        frame = await source.grab()
+    finally:
+        source.close()
+
+    assert len(publishes) >= 3, "the publish was not tried again"
+    assert _MjpegPipe.opened == 1, "retrying the publish restarted capture"
+    assert online and frame is not None and frame.seq > 10
+    assert source.last_error and source.last_error.startswith("live view unavailable: ")
+    assert reported == [(f"{source.last_error}. Detection carries on without it", False)], "the dashboard is told once"
+
+
+async def test_a_camera_on_standby_hands_over_no_frame_from_before_it_stood_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("printguard.server.platform.DEMAND_IDLE_S", 0.1)
+    source = AVSource(_MjpegPipe)
+    try:
+        deadline = time.monotonic() + 15
+        while not source.online and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        watching = await source.grab()
+        source.set_monitoring(False)
+        while source.online and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        stood_down = await source.grab()
+    finally:
+        source.close()
+
+    assert watching is not None and source.standby
+    assert stood_down is None, "a frame from before the camera stood down was handed over as its current one"
+
+
+async def test_a_slow_byte_stream_camera_has_its_rate_measured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Bambu A1 sends about a frame a second, and the raw MJPEG demuxer calls every stream 25."""
+    monkeypatch.setattr("printguard.server.platform.MEASURE_WARMUP_S", 0.2)
+    monkeypatch.setattr("printguard.server.platform.FPS_SAMPLE_S", 1.0)
+    monkeypatch.setattr(_MjpegPipe, "frame_every_s", 0.2)
+
+    source = AVSource(_MjpegPipe)
+    try:
+        deadline = time.monotonic() + 15
+        while not source.online and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        unmeasured = source.fps
+        while not source.fps and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+    finally:
+        source.close()
+
+    assert unmeasured == 0, "the demuxer's default was taken for the camera's rate"
+    assert 3 <= source.fps <= 6
+
+
+async def test_a_reader_that_cannot_be_stopped_is_not_joined_by_another(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A device that opens and never delivers a frame holds its thread inside a read nothing can interrupt.
+
+    Every re-attach used to start another beside it, each with a capture
+    session of its own.
+    """
+    release = threading.Event()
+    opened: list[int] = []
+
+    def stuck_stream(host: str, access_code: str) -> object:
+        opened.append(1)
+        release.wait()
+        raise OSError("gone")
+
+    monkeypatch.setattr("printguard.server.platform.open_bambu_jpeg_stream", stuck_stream)
+    monkeypatch.setattr("printguard.server.platform.OPEN_WAIT_S", 0.2)
+    monkeypatch.setattr("printguard.server.platform.READER_STOP_WAIT_S", 0.2)
+    platform = object.__new__(ServerPlatform)
+    platform.mediamtx = SimpleNamespace(rtsp_url=lambda path: f"rtsp://127.0.0.1:9/{path}")
+    platform._sources, platform._closing, platform._notices = {}, {}, []
+    camera = {"kind": "bambu", "host": "printer", "access_code": "code"}
+
+    try:
+        with pytest.raises(RuntimeError, match="no frames from camera cam1"):
+            await platform.open_camera("cam1", camera)
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="stopped answering and cannot be closed"):
+                await platform.open_camera("cam1", camera)
+        assert opened == [1]
+    finally:
+        release.set()
+    assert platform._closing["cam1"].stopped(5.0)
+    release.clear()
+    with pytest.raises(RuntimeError, match="no frames from camera cam1"):
+        await platform.open_camera("cam1", camera)
+    release.set()
+    assert opened == [1, 1], "a reader that ended still kept its camera from opening"
+
+
+async def test_a_camera_whose_address_can_no_longer_be_pulled_is_still_released() -> None:
+    """A printer can change its webcam to a WebRTC page with no WHEP, and removing that printer must not stop half way."""
+    removed: list[str] = []
+
+    async def remove_path(name: str) -> None:
+        removed.append(name)
+
+    platform = object.__new__(ServerPlatform)
+    platform.mediamtx = SimpleNamespace(remove_path=remove_path)
+    platform._sources, platform._closing = {}, {}
+
+    await platform.release_camera("cam1", {"kind": "url", "url": "http://pi/webcam/webrtc"})
+
+    assert removed == ["cam1"]
+
+
+async def test_an_upload_is_written_off_the_event_loop(tmp_path: Path) -> None:
+    """A sliced file can be hundreds of megabytes onto an SD card, and the loop also carries detection."""
+    loop_thread = threading.get_ident()
+    written_on: list[int] = []
+
+    class Recording(type(tmp_path)):
+        def open(self, *args: object, **kwargs: object) -> object:
+            handle = super().open(*args, **kwargs)
+            real_write = handle.write
+            handle.write = lambda chunk: written_on.append(threading.get_ident()) or real_write(chunk)
+            return handle
+
+    async def chunks() -> object:
+        yield b"G28\n"
+        yield b"G1 X10\n"
+
+    store = DiskFileStore(tmp_path)
+    plain_path = store.path
+    store.path = lambda key: Recording(plain_path(key))
+
+    assert await store.store("benchy.gcode", chunks()) == 11
+    assert (tmp_path / "benchy.gcode").read_bytes() == b"G28\nG1 X10\n"
+    assert written_on and loop_thread not in written_on
+
+
+def test_a_camera_without_mjpeg_is_opened_with_the_next_capture_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FFmpeg refuses a format a YUYV-only webcam lacks with EINVAL, which PyAV does not raise as an ``OSError``."""
+    tried: list[dict[str, str]] = []
+
+    def open_device(file: str, format: str, options: dict[str, str], timeout: float) -> str:
+        tried.append(options)
+        if options.get("input_format") == "mjpeg":
+            raise av.error.ArgumentError(errno.EINVAL, "Invalid argument", file)
+        return "opened"
+
+    monkeypatch.setattr(av, "open", open_device)
+    camera = SimpleNamespace(_source="/dev/video0", _container_format="v4l2", _open_options=V4L2_OPEN_OPTIONS)
+
+    assert AVSource._open(camera) == ("opened", None)
+    assert tried == list(V4L2_OPEN_OPTIONS[:3])
+
+
+async def test_a_plugin_socket_refuses_a_redirect_instead_of_following_it() -> None:
+    """Only the address a plugin declared was checked against its grant."""
+    async with redirected_socket() as (declared, reached):
+        with pytest.raises(websockets.InvalidStatus, match="HTTP 302"):
+            await ServerPlatform.open_socket(None, f"{declared}/feed", lambda state, text: None)
+
+    assert reached == [], "the handshake went on to an address nobody checked"
 
 
 def _capability(card: bytes, device_caps: int) -> bytes:

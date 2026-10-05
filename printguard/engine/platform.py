@@ -34,6 +34,22 @@ class Frame:
     ts: float
 
 
+@dataclass
+class Notice:
+    """Something the runtime worked around that the user should know of.
+
+    Attributes:
+        message: What happened, as the dashboard shows it.
+        recovered: Whether this says an earlier fault is over.
+        camera_id: The camera it concerns, which the engine names in front of
+            the message, or None when it concerns the whole hub.
+    """
+
+    message: str
+    recovered: bool = False
+    camera_id: str | None = None
+
+
 class FrameSource(Protocol):
     """Live handle onto a registered camera."""
 
@@ -160,6 +176,15 @@ class Platform(Protocol):
         """Applies platform-owned settings before inference starts."""
         ...
 
+    def take_notices(self) -> list[Notice]:
+        """Hands over what the runtime has had to work around since the last call.
+
+        The runtime meets these on its own threads, such as an accelerator it
+        passed over for the CPU or a live view it cannot publish, so they wait
+        here until the engine collects them and raises each as a ``warning``.
+        """
+        ...
+
     async def infer(self, rgb: np.ndarray) -> dict[str, Any]:
         """Runs the model on an RGB frame and returns a classify() result."""
         ...
@@ -187,17 +212,30 @@ class Platform(Protocol):
         binary: bool = False,
         timeout: float = 10.0,
         follow_redirects: bool = True,
+        max_bytes: int | None = None,
     ) -> tuple[int, Any]:
         """Performs an HTTP request and returns (status, parsed body).
 
         A plugin's request passes ``follow_redirects=False`` and gets the
         redirect itself back, since only the address it named was checked
-        against its grant.
+        against its grant. It passes ``max_bytes`` too, as do a plugin
+        install, the catalogue and the update check, since none of those
+        answers comes from anywhere PrintGuard trusts.
+
+        Raises:
+            RuntimeError: If following a redirect would send the request under
+                another method, so a command never arrives as a read, or if
+                the body is larger than ``max_bytes`` once decompressed, which
+                is noticed while it arrives and not after, or a capped request
+                is answered in an encoding other than gzip.
         """
         ...
 
     async def open_socket(self, url: str, arrived: Callable[[str, str], None]) -> sockets.Socket:
         """Opens a WebSocket and reports every frame through the callback.
+
+        A redirect is a failed handshake, never followed, since only ``url``
+        was checked.
 
         Args:
             url: A ``ws://`` or ``wss://`` URL, already checked against the

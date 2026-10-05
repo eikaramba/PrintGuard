@@ -64,10 +64,11 @@ class Camera:
         printer_id: Owning printer when the camera was exposed by a printer
             integration, else None. Such cameras are managed by their printer:
             they cannot be removed on their own and are dropped with it.
-        declared: Whether the deployment declared this device rather than a user
+        declared: Whether the deployment declares this device rather than a user
             registering it, as the Docker image does for every camera passed
-            into the container. Such cameras are managed by the deployment: they
-            cannot be removed on their own and go when it stops declaring them.
+            into the container. Such cameras are managed by the deployment and
+            cannot be removed on their own. One whose device is missing at boot
+            stops being declared until the device is back, so it can be removed.
         max_fps: Native frame rate measured when the camera was registered.
         detect_fps: Most inferences a second the user wants spent on this
             camera, to hold down the load on a shared host.
@@ -234,7 +235,8 @@ class PrintFile:
         ext: Its format, which decides which services can print it.
         size: Bytes.
         printer_ids: Printers it was sliced for. Empty means any that prints
-            the format.
+            the format. A printer that is removed keeps its place here, so a
+            file tagged only for it starts nowhere until it is tagged again.
         uploaded: Unix timestamp of the upload.
         meta: What the slicer wrote into it: slicer, time_s, filament_g,
             filament_mm and printer_model, each None where it did not say.
@@ -426,10 +428,16 @@ class CameraRegistry(Registry[Camera]):
         return [c for c in self.values() if c.in_use and c.online]
 
     def sync_in_use(self, monitors: dict[str, dict[str, Any]], printers: "PrinterRegistry") -> None:
-        """Recomputes in_use flags from the monitors currently watching."""
+        """Recomputes in_use flags from the monitors currently watching.
+
+        A camera nothing watches is no longer inferred on, so its achieved rate
+        goes back to zero and is measured afresh when it is watched again.
+        """
         bound = {m["camera_id"] for m in monitors.values() if monitor_watching(m, printers)}
         for camera in self.values():
             camera.in_use = camera.id in bound
+            if not camera.in_use:
+                camera.achieved_fps = camera.last_done = 0.0
             if camera.frame_source:
                 camera.frame_source.set_monitoring(camera.in_use)
 
@@ -440,12 +448,6 @@ class PrinterRegistry(Registry[Printer]):
 
 class PrintRegistry(Registry[PrintFile]):
     """Holds every sliced file in the library keyed by id."""
-
-    def untag(self, printer_id: str) -> None:
-        """Drops a printer from every file it was tagged for."""
-        for record in self.values():
-            if printer_id in record.printer_ids:
-                record.printer_ids.remove(printer_id)
 
 
 class TokenRegistry(Registry[Token]):

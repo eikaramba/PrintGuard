@@ -1,4 +1,3 @@
-import { useEffect, useRef } from "react";
 import { useStore } from "../store";
 import type { Monitor } from "../types";
 import { Sheet } from "./Dialog";
@@ -25,18 +24,13 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 export function DetailPanel({ monitor }: { monitor: Monitor }) {
   const { engine, history, send, openDetail, openStats, openDialog, isPending, updateMonitor } = useStore();
   const settingsPanels = usePluginSurface("settings", monitor.id);
-  const removeRef = useRef(false);
   const removing = isPending("monitor.remove");
-
-  useEffect(() => {
-    if (removeRef.current && !removing) close();
-  }, [removing]);
 
   const camera = engine?.cameras.find((c) => c.id === monitor.camera_id);
   const printer = engine?.printers.find((p) => p.id === monitor.printer_id);
   const printers = engine?.printers ?? [];
   const points = history[monitor.id] ?? [];
-  const score = camera?.online ? (points.at(-1)?.score ?? 0) : null;
+  const score = camera?.online && monitor.watching ? (points.at(-1)?.score ?? 0) : null;
   const close = () => openDetail(null);
 
   return (
@@ -104,7 +98,7 @@ export function DetailPanel({ monitor }: { monitor: Monitor }) {
             label="Alert threshold"
             value={monitor.threshold}
             min={0.05}
-            max={1}
+            max={0.95}
             step={0.01}
             hint="The score a frame must reach to count as a defect. Raise to cut false alarms; lower to catch subtler failures."
             onChange={(v) => updateMonitor(monitor.id, { threshold: v })}
@@ -113,7 +107,7 @@ export function DetailPanel({ monitor }: { monitor: Monitor }) {
             label="Consecutive detections to alert"
             value={monitor.consecutive}
             min={1}
-            max={15}
+            max={30}
             step={1}
             format={String}
             hint="Flagged frames in a row before it acts. Raise to ride out brief blips; lower to react faster."
@@ -154,7 +148,7 @@ export function DetailPanel({ monitor }: { monitor: Monitor }) {
 
       <Section title="Printer">
         <div className="space-y-3">
-          <select className="field" value={monitor.printer_id} onChange={(e) => updateMonitor(monitor.id, { printer_id: e.target.value })}>
+          <select className="field" aria-label="Printer" value={monitor.printer_id} onChange={(e) => updateMonitor(monitor.id, { printer_id: e.target.value })}>
             <option value="">No printer (alerts only)</option>
             {printers.map((p) => (
               <option key={p.id} value={p.id}>
@@ -174,10 +168,7 @@ export function DetailPanel({ monitor }: { monitor: Monitor }) {
         <button
           className="btn btn-danger"
           disabled={removing}
-          onClick={() => {
-            removeRef.current = true;
-            send({ cmd: "monitor.remove", id: monitor.id });
-          }}
+          onClick={() => send({ cmd: "monitor.remove", id: monitor.id })}
         >
           {removing ? "Deleting…" : "Delete"}
         </button>

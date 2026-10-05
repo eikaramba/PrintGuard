@@ -150,6 +150,12 @@ the way GitHub renders it, relative image paths included. For a repository insta
 are read from the repository at the pinned commit. A zip carries them inside it. Either way
 they add nothing to what runs, which is why an SVG is allowed here and not in `assets`.
 
+The README is shown as Markdown and little else. Headings, paragraphs, lists, links, images,
+code, tables and blockquotes are kept, with `align` on a table cell or paragraph and `width` and
+`height` on an image. Any other HTML is dropped and its text kept, so forms, `<details>`, video,
+inline SVG, `style`, `class` and task-list checkboxes do not render. Relative links and images
+resolve against the README's own folder.
+
 ### Surfaces
 
 | Surface | Where it puts you |
@@ -205,10 +211,15 @@ script renamed to `.png` is refused. SVG is not on the list, since it is markup.
 A `*` scheme covers http and https, and `ws`, `wss`, `rtsp` and `rtsps` are named in full. A
 missing port means any port. An IPv6 address goes in brackets, as `http://[fd00::1]/*`.
 
+The scheme and host match in any case. The path matches as written, so
+`https://api.telegram.org/bot*/sendMessage` does not cover `/bot1/sendmessage`. A `*` in a path
+stands for any run of characters, `/` and the query string included.
+
 A URL with a `.` or `..` segment in its path matches no pattern, percent-encoded or not.
 
 A pattern on this machine or the network around it needs `net:local` as well as `net`. A
-wildcard host counts, since it covers both. PrintGuard resolves the name and checks the address
+wildcard host counts, since it covers both. So does an address in any spelling a browser takes,
+such as `127.1` or `2130706433`. PrintGuard resolves the name and checks the address
 it resolves to, so a public name pointing somewhere private is caught.
 
 ## The three halves
@@ -232,6 +243,10 @@ that.
 syntax error and there's no network. The `plugin.js` iframe does have a `document`, but the
 frame is hidden and its policy allows no styles or images, so nothing put there is shown. The
 opaque origin refuses storage. The worker has no DOM at all.
+
+Neither frame has `fetch`, `WebSocket` or `RTCPeerConnection`, and a frame made inside one runs
+no script of its own. [What a browser still allows](plugins.md#what-a-browser-still-allows)
+lists what is left.
 
 ### plugin.js
 
@@ -288,6 +303,10 @@ the `panel` surface.
 
 It runs in an opaque origin with `connect-src 'none'`, so `pg` is the only way out.
 
+Scripts go in `<script>` elements. An inline handler such as `onclick="..."` is refused, so use
+`addEventListener`. The frame cannot leave the page either: a link or a `location` change to
+another address stops the plugin with "sandbox navigated away".
+
 | On `pg` | |
 |---|---|
 | `pg.on("ready", fn)` | Called with the state once the panel is drawn |
@@ -321,7 +340,9 @@ plugin.on("tick", (event, ctx) => ctx.log(`${ctx.store.alerts || 0} alerts so fa
 That needs `alert` in `events` and a `tick_s`.
 
 A worker still busy with the last event is skipped, so a slow plugin drops events instead of
-falling behind. One that fails or runs past its limits is disabled and reported.
+falling behind. One that fails or runs past its limits is disabled and reported, and so is one
+whose answer is not the store and effects PrintGuard asked for, such as a worker that has
+redefined `toJSON` on a built-in prototype.
 
 A worker has `plugin` and the JavaScript built-ins in scope and nothing else. There is no
 `console` or `print`, so log with `ctx.log`. A call ends when your handler returns, so a promise
@@ -514,10 +535,18 @@ it base64 encoded. The manifest needs `http` in `events`, or the answer never re
 A redirect is not followed. Its 3xx status arrives as the answer, so ask for the address the
 service finally answers on.
 
+A body over 256 KB fails the request, whether it is JSON, text or `binary`. The size is counted
+after decompression and before base64. PrintGuard asks for gzip or nothing, and an answer in any
+other encoding fails the same way. Nothing is cut short, so no `http` event arrives and the
+dashboard shows an error naming the host.
+
 ### Sockets
 
 `ctx.socket` opens a WebSocket under a tag and `socket` events carry it, with `state` saying
-`open`, `message` or `closed`. PrintGuard drops it when the plugin is disabled, reinstalled or removed, or loses `net` or `net:local`. The manifest needs `socket` in `events` and a `ws` or `wss` pattern in `urls`.
+`open`, `message` or `closed`. PrintGuard drops it when the plugin is disabled, reinstalled or removed, is stopped for failing, or loses `net` or `net:local`. A socket still connecting at that moment is closed as soon as it opens. The manifest needs `socket` in `events` and a `ws` or `wss` pattern in `urls`.
+
+A redirect is not followed here either. The socket fails to open, so declare the address the
+service finally answers on.
 
 ```js
 plugin.on("tick", (event, ctx) => ctx.socket({ url: "wss://hub.local:8123/api/websocket", tag: "hub" }));
@@ -595,8 +624,10 @@ app shared by everyone who installs the plugin, which is what providers hand out
 against. Whoever installs it [registers their own](plugins.md#credentials), and PrintGuard shows
 them the redirect URI to give the provider and links `register_url`.
 
-`authorize_url` and `token_url` are each one `https` address with no wildcards. A `token_url`
-on this machine or the network around it needs `net:local`.
+`authorize_url` and `token_url` are each one `https` address with no wildcards. An
+`authorize_url` may carry a query of its own, which is kept. A `token_url`
+on this machine or the network around it needs `net:local`. An update that changes either one
+signs its users out and has to be accepted again.
 
 ## Talking to other plugins
 
@@ -665,9 +696,17 @@ plugin.route((request, ctx) => ({
 | `body` | A string |
 | `headers` | `set-cookie`, `location` and `cache-control`. Anything else is dropped |
 
-Every response goes out under a content security policy of `sandbox allow-forms allow-scripts`
-and `frame-ancestors 'none'`. The page gets an opaque origin, so it can render, script itself and
-post a form, but it cannot act as the dashboard or be framed by it.
+Every response goes out under a content security policy with `sandbox allow-forms allow-scripts`
+and `frame-ancestors 'none'`. The page gets an opaque origin, so it cannot act as the dashboard or
+be framed by it. The same policy keeps the page to what its own response carries.
+
+| A page | |
+|---|---|
+| Scripts and styles | Inline only. A `<script src>` or a stylesheet link is refused, your own routes included |
+| Images, audio, video and fonts | `data:` addresses, and `blob:` for all but fonts |
+| `fetch`, `XMLHttpRequest`, `WebSocket`, `sendBeacon` | Refused. A page talks to its worker by posting a form or following a link |
+| Forms | Post to the hub only, so to your own routes |
+| Links and `location` | Go anywhere. The browser does not stop a tab leaving |
 
 `plugin.gate` sees every other request to the hub and needs `gate`.
 
@@ -677,8 +716,9 @@ plugin.gate((request, ctx) => request.path.startsWith("/api/") || Boolean(ctx.st
 
 | Gate rule | |
 |---|---|
-| What refuses | Anything but `true`, and a gate that fails to answer. The request gets a 403. A gate that fails is then disabled like any other plugin, and every request is refused until it is enabled again, reinstalled or removed, or the hub starts with `PRINTGUARD_PLUGINS=off` |
+| What refuses | Anything but `true`, and a gate that throws or runs out of fuel or memory. The request gets a 403. A gate that fails is then disabled like any other plugin, and every request is refused until it is enabled again, reinstalled or removed, or the hub starts with `PRINTGUARD_PLUGINS=off` |
 | What it sees | The same request shape a route gets, with no body. WebSocket handshakes are asked about too, as a `GET` |
+| Under load | A request that waits more than 5 seconds for the gate to be free is refused on its own. The gate is not disabled for it |
 | What stays open | `/api/health` and the gating plugin's own pages, so uptime checks keep working and it can serve its own sign-in page |
 | Caching | An approval is cached for 10 seconds per cookie, authorization header, method and path. A refusal is never cached, so signing in takes effect at once |
 
@@ -687,7 +727,7 @@ plugin.gate((request, ctx) => request.path.startsWith("/api/") || Boolean(ctx.st
 | What | Limit |
 |---|---|
 | Source file | 256 KB each |
-| Asset | 4 MB each, 12 MB across a plugin |
+| Asset | 4 MB each, 12 MB across a plugin. An install is refused at the file that passes either |
 | README in a zip | 64 KB |
 | Media | 8 images |
 | Secrets | 8, each value 4 KB |
@@ -698,14 +738,14 @@ plugin.gate((request, ctx) => request.path.startsWith("/api/") || Boolean(ctx.st
 | `tick_s` | 5 to 86400 seconds, fired on a 5 second clock, so 7 means 10 |
 | Effects | 32 per call. The rest are dropped |
 | `plugin.js` call | 4 seconds, then the plugin is stopped |
-| Worker call | 5 seconds, 96 MB of memory and 400 million units of wasmtime fuel, then the plugin is disabled |
-| Worker output | 512 KB per call, the store and effects together |
+| Worker call | 96 MB of memory and 400 million units of wasmtime fuel, then the plugin is disabled. A call that waits more than 5 seconds to start is dropped |
+| Worker output | 512 KB per call, the store and effects together, then the plugin is disabled. So is one whose output is not an object carrying a list of effects |
 | Node tree | 400 nodes |
 | Node text | `label` 80 characters, `action` 60, `placeholder` 60 |
 | `select` options | 60 |
 | `panel.html` height | 900px |
 | `ctx.http` | 60 requests a minute per plugin, 10 seconds each. A refused request gets no `http` event |
-| `ctx.http` answer | A string body is cut at 256 KB, a base64 one included |
+| `ctx.http` answer | 256 KB once decompressed, whatever its type. A larger one fails the request and no `http` event arrives |
 | Sockets | 4 open per plugin, 64 KB per text frame sent, 256 KB per frame received, 10 seconds to open |
 | Sandbox start | 8 seconds for `plugin.js` or `panel.html` to load |
 | OAuth sign-in | 10 minutes to finish it |

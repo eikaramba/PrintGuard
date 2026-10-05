@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 from . import oauth, urls
 from .adapters import HttpFn
+from .bounds import clamp
 
 MANIFEST_FILE = "plugin.json"
 SOURCE_FILES = ("plugin.js", "worker.js", "panel.html")
@@ -31,6 +32,7 @@ SURFACES = ("panel", "monitor", "settings")
 MAX_SOURCE_BYTES = 256 * 1024
 MAX_CONFIG_BYTES = 16 * 1024
 MIN_TICK_S = 5.0
+MAX_TICK_S = 86400.0
 MAX_SECRETS = 8
 MAX_CHANNELS = 8
 MAX_CONSUMES = 16
@@ -49,6 +51,8 @@ GITHUB_COMMIT_URL = "https://api.github.com/repos/{repo}/commits/{ref}"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/{repo}/{sha}/{path}"
 GITHUB_HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
 TIMEOUT_S = 20.0
+MAX_LISTING_BYTES = 4 * 1024 * 1024
+"""The most the catalogue, or GitHub's description of a commit, may come to."""
 
 ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$")
 _REPO_PATTERN = re.compile(r"^[\w.-]+/[\w.-]+$")
@@ -288,6 +292,12 @@ need the grant that reads the dashboard.
 """
 
 
+LINK_ACTIONS = ("call", "answer", "publish")
+"""What a ``link`` effect may ask for, each a ``plugin.<action>`` command."""
+
+SIGN_IN_ENDPOINTS = ("authorize_url", "token_url")
+"""Where a manifest's ``oauth`` block sends the user and the tokens."""
+
 UI_EFFECTS: dict[str, str] = {"notify": "notify", "sound": "sound", "background": "background"}
 """Effects a dashboard carries out for a plugin, and the permission each needs.
 
@@ -408,12 +418,30 @@ def same_source(previous: dict[str, Any], current: dict[str, Any]) -> bool:
     return (previous["repo"], previous.get("path", "")) == (current["repo"], current.get("path", ""))
 
 
+def same_sign_in(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Whether two manifests sign in at the same endpoints.
+
+    A stored refresh token is sent to the token endpoint, so an update naming a
+    different one would hand the session to wherever it says.
+
+    Args:
+        previous: The manifest the sign-in was made against.
+        current: The manifest being installed over it.
+
+    Returns:
+        True when the authorise and token addresses are unchanged, or neither
+        manifest signs in to anything.
+    """
+    return all(previous["oauth"].get(key) == current["oauth"].get(key) for key in SIGN_IN_ENDPOINTS)
+
+
 def widens(previous: dict[str, Any], current: dict[str, Any]) -> bool:
     """Whether an update reaches further than the manifest that was accepted.
 
-    Permissions, addresses and the plugins it calls are what the user agreed to,
-    so a change to any of them is a fresh question. Anything not written exactly
-    as before counts as wider, since a narrower-looking pattern can cover more.
+    Permissions, addresses, the plugins it calls and where it signs in are what
+    the user agreed to, so a change to any of them is a fresh question. Anything
+    not written exactly as before counts as wider, since a narrower-looking
+    pattern can cover more.
 
     Args:
         previous: The manifest the grants were given against.
@@ -422,7 +450,9 @@ def widens(previous: dict[str, Any], current: dict[str, Any]) -> bool:
     Returns:
         True when the new manifest asks for anything the old one did not.
     """
-    return any(not set(current[field]) <= set(previous[field]) for field in ("permissions", "urls", "consumes"))
+    return not same_sign_in(previous, current) or any(
+        not set(current[field]) <= set(previous[field]) for field in ("permissions", "urls", "consumes")
+    )
 
 
 def runs_here(platforms: list[str], host: str) -> bool:
@@ -486,6 +516,25 @@ def asset_type(name: str) -> str | None:
     return ASSET_TYPES.get(extension) if _ASSET_PATTERN.match(name) else None
 
 
+def within_budget(name: str, size: int, held: int) -> int:
+    """Counts one more file towards what a plugin may ship.
+
+    Args:
+        name: The file, for the refusal.
+        size: How many bytes it is.
+        held: The bytes of the files counted before it.
+
+    Returns:
+        The running total with this file in it.
+
+    Raises:
+        ValueError: If the file is too large, or takes the plugin past its total.
+    """
+    if size > MAX_ASSET_BYTES or held + size > MAX_ASSETS_BYTES:
+        raise ValueError(f"{name} takes the plugin past {MAX_ASSETS_BYTES // 1024} KB of files")
+    return held + size
+
+
 def sanitise_assets(raw: dict[str, bytes]) -> dict[str, str]:
     """Checks a plugin's shipped files and encodes them for the record.
 
@@ -504,9 +553,7 @@ def sanitise_assets(raw: dict[str, bytes]) -> dict[str, str]:
         media = asset_type(name)
         if media is None:
             raise ValueError(f"{name} is not a kind of file a plugin may ship")
-        total += len(data)
-        if len(data) > MAX_ASSET_BYTES or total > MAX_ASSETS_BYTES:
-            raise ValueError(f"{name} takes the plugin past {MAX_ASSETS_BYTES // 1024} KB of files")
+        total = within_budget(name, len(data), total)
         starts = ASSET_MAGIC.get(media)
         if starts and not (data.startswith(starts) or (media == "video/mp4" and data[4:8] == b"ftyp")):
             raise ValueError(f"{name} is not really {media}")
@@ -627,7 +674,7 @@ def sanitise_manifest(raw: Any) -> dict[str, Any]:
         raise ValueError(f"reaching {', '.join(local)} needs the net:local permission")
     events = sorted(({str(e).strip() for e in raw.get("events", [])} & set(EVENTS)) | linked_events(raw))
     try:
-        tick_s = max(0.0, float(raw.get("tick_s", 0)))
+        tick_s = clamp("tick_s", raw.get("tick_s", 0), 0.0, MAX_TICK_S)
     except (TypeError, ValueError):
         tick_s = 0.0
     return {
@@ -650,7 +697,7 @@ def sanitise_manifest(raw: Any) -> dict[str, Any]:
         "consumes": consumes,
         "oauth": sign_in,
         "events": events,
-        "tick_s": min(tick_s, 86400.0) if tick_s >= MIN_TICK_S else 0.0,
+        "tick_s": tick_s if tick_s >= MIN_TICK_S else 0.0,
     }
 
 
@@ -670,7 +717,13 @@ def outbound_link(plugin_id: str, kind: str, request: Any) -> dict[str, Any]:
 
     The id is set last, so a sandbox cannot spread over the command and speak as
     somebody else.
+
+    Raises:
+        ValueError: If the plugin named anything but one of those three, which
+            would otherwise reach any command that starts the same way.
     """
+    if kind not in LINK_ACTIONS:
+        raise ValueError(f"{kind!r} is not a way to talk to another plugin")
     fields = request if isinstance(request, dict) else {}
     return {
         "cmd": f"plugin.{kind}",
@@ -701,7 +754,7 @@ def sanitise_sign_in(raw: Any) -> dict[str, Any]:
     """
     if not isinstance(raw, dict) or not raw:
         return {}
-    endpoints = {key: str(raw.get(key, "")).strip() for key in ("authorize_url", "token_url")}
+    endpoints = {key: str(raw.get(key, "")).strip() for key in SIGN_IN_ENDPOINTS}
     if any("*" in value or urlsplit(value).scheme != "https" or not urlsplit(value).hostname for value in endpoints.values()):
         raise ValueError("oauth needs an https authorize_url and token_url")
     return {
@@ -786,7 +839,8 @@ def unpack(data: bytes) -> tuple[dict[str, Any], dict[str, str], dict[str, bytes
         path the manifest uses.
 
     Raises:
-        ValueError: If the zip is unreadable or carries no manifest.
+        ValueError: If the zip is unreadable, carries no manifest, or declares
+            more than a plugin may ship, which is refused before it is unpacked.
     """
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
@@ -808,17 +862,24 @@ def unpack(data: bytes) -> tuple[dict[str, Any], dict[str, str], dict[str, bytes
     manifest = json.loads(read(MANIFEST_FILE, MAX_SOURCE_BYTES))
     sources = {name: read(name, MAX_SOURCE_BYTES).decode("utf-8", "replace") for name in SOURCE_FILES if name in entries}
     declared = {str(name).strip().lower() for name in manifest.get("assets", []) if isinstance(manifest, dict)}
-    assets = {name: read(name, MAX_ASSET_BYTES) for name in sorted(declared) if name in entries}
+    assets: dict[str, bytes] = {}
+    total = 0
+    for name in sorted(declared & entries.keys()):
+        total = within_budget(name, archive.getinfo(entries[name]).file_size, total)
+        assets[name] = archive.read(entries[name])
     listed = [str(manifest.get("icon", "")).strip().lower(), README_FILE]
     listed += [str(shot).strip().lower() for shot in manifest.get("media", []) if isinstance(manifest, dict)]
     named = set(archive.namelist())
     page: dict[str, bytes] = {}
+    total = 0
     for path in listed:
         entry = f"{prefix}{path}"
-        if path and entry in named:
+        if path and path not in page and entry in named:
+            size = archive.getinfo(entry).file_size
             cap = MAX_README_BYTES if path == README_FILE else MAX_ASSET_BYTES
-            if archive.getinfo(entry).file_size <= cap:
+            if size <= cap and total + size <= MAX_ASSETS_BYTES:
                 page[path] = archive.read(entry)
+                total += size
     return manifest, sources, assets, page
 
 
@@ -861,7 +922,8 @@ async def fetch_github(http: HttpFn, repo: str, path: str, ref: str) -> tuple[di
         resolved commit SHA.
 
     Raises:
-        ValueError: If the reference is unusable or the plugin is not there.
+        ValueError: If the reference is unusable, the plugin is not there, or
+            its assets pass what a plugin may ship, at the file that does it.
     """
     if not _REPO_PATTERN.match(repo):
         raise ValueError(f"{repo!r} is not an owner/name repository")
@@ -870,29 +932,41 @@ async def fetch_github(http: HttpFn, repo: str, path: str, ref: str) -> tuple[di
         raise ValueError(f"{path!r} is not a usable path")
     sha = ref if _SHA_PATTERN.match(ref) else await _resolve_commit(http, repo, ref)
     prefix = f"{path}/" if path else ""
-    status, manifest = await http("GET", GITHUB_RAW_URL.format(repo=repo, sha=sha, path=f"{prefix}{MANIFEST_FILE}"), timeout=TIMEOUT_S)
+    status, manifest = await http(
+        "GET", GITHUB_RAW_URL.format(repo=repo, sha=sha, path=f"{prefix}{MANIFEST_FILE}"), timeout=TIMEOUT_S, max_bytes=MAX_SOURCE_BYTES
+    )
     if status != 200 or not isinstance(manifest, dict):
         raise ValueError(f"no {MANIFEST_FILE} at {repo}/{prefix} ({status})")
     sources: dict[str, str] = {}
     for name in SOURCE_FILES:
-        status, body = await http("GET", GITHUB_RAW_URL.format(repo=repo, sha=sha, path=f"{prefix}{name}"), timeout=TIMEOUT_S)
+        status, body = await http(
+            "GET", GITHUB_RAW_URL.format(repo=repo, sha=sha, path=f"{prefix}{name}"), timeout=TIMEOUT_S, max_bytes=MAX_SOURCE_BYTES
+        )
         if status == 200 and isinstance(body, str):
             sources[name] = body
     assets: dict[str, bytes] = {}
+    total = 0
     for name in sorted({str(a).strip().lower() for a in manifest.get("assets", [])}):
         if asset_type(name) is None:
             raise ValueError(f"{name} is not a kind of file a plugin may ship")
         status, body = await http(
-            "GET", GITHUB_RAW_URL.format(repo=repo, sha=sha, path=f"{prefix}{name}"), binary=True, timeout=TIMEOUT_S
+            "GET",
+            GITHUB_RAW_URL.format(repo=repo, sha=sha, path=f"{prefix}{name}"),
+            binary=True,
+            timeout=TIMEOUT_S,
+            max_bytes=MAX_ASSET_BYTES,
         )
         if status != 200 or not isinstance(body, str):
             raise ValueError(f"no {name} at {repo}/{prefix} ({status})")
         assets[name] = base64.b64decode(body)
+        total = within_budget(name, len(assets[name]), total)
     return manifest, sources, assets, sha
 
 
 async def _resolve_commit(http: HttpFn, repo: str, ref: str) -> str:
-    status, body = await http("GET", GITHUB_COMMIT_URL.format(repo=repo, ref=ref), headers=GITHUB_HEADERS, timeout=TIMEOUT_S)
+    status, body = await http(
+        "GET", GITHUB_COMMIT_URL.format(repo=repo, ref=ref), headers=GITHUB_HEADERS, timeout=TIMEOUT_S, max_bytes=MAX_LISTING_BYTES
+    )
     if status != 200 or not isinstance(body, dict) or not _SHA_PATTERN.match(str(body.get("sha", ""))):
         raise ValueError(f"GitHub could not resolve {repo}@{ref} ({status})")
     return str(body["sha"])
@@ -904,7 +978,7 @@ async def fetch_catalogue(http: HttpFn, url: str) -> list[dict[str, Any]]:
     Raises:
         RuntimeError: If the catalogue cannot be read.
     """
-    status, body = await http("GET", url, timeout=TIMEOUT_S)
+    status, body = await http("GET", url, timeout=TIMEOUT_S, max_bytes=MAX_LISTING_BYTES)
     if status != 200:
         raise RuntimeError(f"catalogue at {url} returned {status}")
     if not isinstance(body, dict) or not isinstance(body.get("plugins"), list):

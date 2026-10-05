@@ -1206,12 +1206,13 @@ wheels = [
 
 [[package]]
 name = "printguard"
-version = "2.5.1"
+version = "2.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "ai-edge-litert" },
     { name = "aiomqtt" },
     { name = "av" },
+    { name = "cachetools" },
     { name = "fastapi" },
     { name = "fastmcp" },
     { name = "httpx" },
@@ -1257,7 +1258,8 @@ dev = [
 requires-dist = [
     { name = "ai-edge-litert", specifier = ">=2.1.5" },
     { name = "aiomqtt", specifier = ">=2.5.1" },
-    { name = "av", specifier = ">=14.0" },
+    { name = "av", specifier = ">=18.0" },
+    { name = "cachetools", specifier = ">=7.1.4" },
     { name = "desktop-notifier", marker = "extra == 'desktop'", specifier = ">=6.1" },
     { name = "fastapi", specifier = ">=0.136.3" },
     { name = "fastmcp", specifier = ">=3.4.2" },

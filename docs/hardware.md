@@ -47,12 +47,12 @@ in the acceleration runtime they bundle.
 | `latest-nvidia` | `amd64` | TensorRT RTX execution provider and the CUDA 12 runtime | You have an RTX 30 series or newer and the NVIDIA Container Toolkit |
 
 Each variant is also tagged `X.Y.Z` and `X.Y`, with the same suffix, for example
-`2.5.1-intel`. Pin `X.Y` if you want patch updates without surprises.
+`X.Y.Z-intel`. Pin `X.Y` if you want patch updates without surprises.
 
 > [!NOTE]
 > The Intel GPU compute runtime is roughly 370 MB of compiler and driver libraries that do
 > nothing unless a GPU device is passed in, which is why it lives in its own tag rather
-> than the default image. Intel **CPU** acceleration through OpenVINO is in the standard
+> than the default image. Intel CPU acceleration through OpenVINO is in the standard
 > `amd64` image and needs no extra tag.
 
 ## Choosing a variant
@@ -97,14 +97,14 @@ the result is the `workers` term the scheduler divides by latency to get
 
 ## Execution providers by platform
 
-ONNX Runtime takes the first device its providers offer, preferring a GPU, then an NPU, then
-the CPU. What is available depends on the platform:
+ONNX Runtime takes the first device its providers offer that can run the model, preferring a
+GPU, then an NPU, then the CPU. What is available depends on the platform:
 
 | Platform | Provider | Notes |
 |---|---|---|
 | macOS, desktop app | Core ML | Uses CPU, GPU and the Neural Engine |
-| Windows 11 24H2 or newer, desktop app | Windows ML | Installs the certified Intel, NVIDIA, AMD or Qualcomm provider on first launch. Needs the [Windows App Runtime](https://learn.microsoft.com/en-us/windows/apps/windows-app-sdk/downloads) 2.x and stays on the CPU without it |
-| Older Windows, desktop app | Optimised CPU | No provider install |
+| Windows 11 24H2 or newer, desktop app | Windows ML | Installs the certified Intel, NVIDIA, AMD or Qualcomm provider on first launch. Needs the [Windows App Runtime](https://learn.microsoft.com/en-us/windows/apps/windows-app-sdk/downloads) 2.x and uses DirectML without it |
+| Older Windows, desktop app | DirectML | Runs on the GPU through its DirectX 12 driver, with no provider install, and reads `microsoft gpu`. Stays on the CPU without a driver |
 | Linux `amd64`, standard image | OpenVINO | Intel CPU path out of the box, and the GPU needs `latest-intel` and `/dev/dri` |
 | Linux `amd64`, `latest-nvidia` | TensorRT RTX | Needs the NVIDIA Container Toolkit on the host |
 | Linux `amd64`, AMD ROCm / native | MIGraphX or ROCm | Needs ROCm 7.x runtime, `onnxruntime-migraphx`, and `/dev/dri` + `/dev/kfd` |
@@ -112,7 +112,11 @@ the CPU. What is available depends on the platform:
 
 If no accelerator is usable, PrintGuard keeps working on the CPU. On an `amd64` image that is
 OpenVINO's CPU path, which the `latest-nvidia` image carries too, and elsewhere it is ONNX
-Runtime's own CPU provider.
+Runtime's own CPU provider. That covers an accelerator that is offered but can't build or run
+the model, such as a GPU out of memory or a driver the provider rejects. The dashboard and the
+log name the device and the reason in a warning that it `cannot run the model, so detection is
+not using it`, and **compute** names the device used instead. It applies with the runtime pinned
+to ONNX too.
 
 ## Intel GPU
 
@@ -215,10 +219,11 @@ and as **Active compute** in the Advanced tab in Settings.
 | `intel gpu`, `intel npu` | OpenVINO on that device |
 | `intel cpu` | OpenVINO on the processor, whoever made it |
 | `litert cpu` | LiteRT on the processor |
+| `apple core ml` | Core ML on a Mac, which shares the model between the CPU, GPU and Neural Engine itself |
 | `onnx cpu` | ONNX Runtime's own CPU provider, where no other provider offered a device |
 
-A Core ML, Windows ML or TensorRT device is named the same way, by its provider's vendor. The
-Advanced tab in Settings offers:
+A Windows ML or TensorRT device is named the same way as OpenVINO's, by its provider's vendor.
+The Advanced tab in Settings offers:
 
 | Setting | Effect |
 |---|---|

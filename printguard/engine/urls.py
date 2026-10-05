@@ -47,6 +47,11 @@ def link(raw: Any) -> str:
     return url if parts.scheme in ("http", "https") and parts.netloc else ""
 
 
+def _fold(raw: str) -> str:
+    """Lowercases a pattern's scheme and host, the parts of an address that ignore case."""
+    return re.sub(r"^[^/]*//[^/]*", lambda origin: origin.group().lower(), raw.strip())
+
+
 def parse(raw: str) -> dict[str, str] | None:
     """Reads one pattern, or None if it is not one.
 
@@ -56,7 +61,7 @@ def parse(raw: str) -> dict[str, str] | None:
     Returns:
         Its scheme, host, port and path, or None when the pattern is malformed.
     """
-    match = PATTERN.match(raw.strip().lower())
+    match = PATTERN.match(_fold(raw))
     if not match:
         return None
     parts = match.groupdict()
@@ -72,7 +77,25 @@ def _matches_host(pattern: str, host: str) -> bool:
 
 
 def _matches_path(pattern: str, path: str) -> bool:
-    return re.fullmatch(".*?".join(re.escape(part) for part in pattern.split("*")), path) is not None
+    """Whether a path fits a pattern whose ``*`` each stand for any run of characters.
+
+    The literal pieces are looked for in order, each as early as it can sit, so
+    the work grows with the path and never with the number of wildcards.
+    """
+    first, *middle = pattern.split("*")
+    if not middle:
+        return path == first
+    last = middle.pop()
+    end = len(path) - len(last)
+    if not path.startswith(first) or end < len(first) or not path.endswith(last):
+        return False
+    at = len(first)
+    for piece in middle:
+        found = path.find(piece, at, end)
+        if found < 0:
+            return False
+        at = found + len(piece)
+    return True
 
 
 def _climbs(path: str) -> bool:
@@ -118,11 +141,21 @@ def allowed(url: str, patterns: list[str]) -> bool:
 
 
 def is_local_address(host: str) -> bool:
-    """Whether a host literal is an address on the machine or its network."""
+    """Whether a host literal is an address on the machine or its network.
+
+    An IPv4 address is read in every spelling a resolver takes, so ``127.1``,
+    ``0x7f.0.0.1`` and ``2130706433`` are all the loopback address. An IPv4
+    address written inside an IPv6 one is judged as the IPv4 address it is,
+    which Python only began doing for itself part way through 3.12.
+    """
     try:
         address = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
-        return host in LOCAL_HOSTNAMES or host.endswith(LOCAL_SUFFIXES)
+        try:
+            address = ipaddress.ip_address(socket.inet_aton(host))
+        except OSError:
+            return host in LOCAL_HOSTNAMES or host.endswith(LOCAL_SUFFIXES)
+    address = getattr(address, "ipv4_mapped", None) or address
     return not address.is_global or address.is_private or address.is_loopback
 
 
@@ -191,12 +224,12 @@ def sanitise(raw: Any) -> list[str]:
         raw: The manifest's ``urls`` field.
 
     Returns:
-        The patterns, lowercased and deduplicated.
+        The patterns, deduplicated, with scheme and host lowercased.
 
     Raises:
         ValueError: If any of them is not a match pattern.
     """
-    patterns = sorted({str(item).strip().lower() for item in raw or [] if str(item).strip()})
+    patterns = sorted({_fold(str(item)) for item in raw or [] if str(item).strip()})
     unreadable = [pattern for pattern in patterns if parse(pattern) is None]
     if unreadable:
         raise ValueError(f"not a URL match pattern: {', '.join(unreadable)}")

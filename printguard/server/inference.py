@@ -14,6 +14,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -38,6 +39,10 @@ WINDOWS_PROVIDERS = {
     "VitisAIExecutionProvider",
 }
 DEFAULT_CPU_PROVIDER = "CPUExecutionProvider"
+CORE_ML_PROVIDERS = [
+    ("CoreMLExecutionProvider", {"ModelFormat": "MLProgram", "MLComputeUnits": "ALL", "RequireStaticInputShapes": "1"}),
+    DEFAULT_CPU_PROVIDER,
+]
 DEVICE_PRIORITY = ("GPU", "NPU", "CPU")
 SOFTWARE_ADAPTER = (0x1414, 0x8C)
 REGISTERED_LIBRARIES: set[str] = set()
@@ -140,7 +145,13 @@ def _measure_concurrency(model: Model) -> tuple[int, float]:
 
 
 class OnnxInference:
-    """Runs the ONNX model through the fastest available execution provider.
+    """Runs the ONNX model through the fastest execution provider that can run it.
+
+    Every device the providers offer is tried, fastest first, and one that cannot
+    build a session or get through the benchmark is skipped with a warning, ending
+    on ONNX Runtime's own CPU provider. ONNX Runtime's own fallback is switched off
+    while that is decided: it retries on the CPU in silence, which would leave the
+    `compute` readout naming hardware the model never ran on.
 
     Core ML compiles the model on every session rather than into a cache directory.
     Its cache lookup builds the model URL with `NSURL URLWithString`, which yields
@@ -148,117 +159,116 @@ class OnnxInference:
     Support` fails every session it is meant to speed up - and the desktop app,
     which is where that path is used, could not start at all. Compiling costs
     about 0.2s per session.
+
+    Attributes:
+        device: Name of the hardware the model runs on.
+        measured: Worker count the device sustains, and its throughput there.
+        skipped: One message for each device that was offered and passed over.
     """
 
     runtime = "onnx"
 
     def __init__(self, model_path: Path) -> None:
+        self.skipped: list[str] = []
         self._resources = ExitStack()
+        self._model_path = str(model_path)
         self._register_plugins()
         if sys.platform == "win32":
             self._register_windows_providers()
 
         devices = _execution_devices(ort.get_ep_devices())
-        available = ort.get_available_providers()
-        gpu_devices = [d for d in devices if d.device.type.name in ("GPU", "NPU")]
+        if "MIGraphXExecutionProvider" in ort.get_available_providers():
+            self._migraphx_cache()
 
-        if "MIGraphXExecutionProvider" in available and "ORT_MIGRAPHX_MODEL_CACHE_PATH" not in os.environ:
-            cache_dir = Path(os.environ.get("DATA_DIR", REPO_ROOT / "data")) / "cache" / "migraphx"
+        accelerated = [(_device_label(device), partial(self._session_on, [device])) for device in devices]
+        if devices:
+            logger.info("execution providers offer: %s", ", ".join(label for label, _ in accelerated))
+        elif "CoreMLExecutionProvider" in ort.get_available_providers():
+            accelerated = [("Apple Core ML", partial(self._session_on, [], CORE_ML_PROVIDERS))]
+        else:
+            accelerated = [(label, partial(self._amd_session, provider)) for label, provider in self._amd_providers()]
+        for label, build in accelerated:
+            self.device = label
             try:
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                os.environ["ORT_MIGRAPHX_MODEL_CACHE_PATH"] = str(cache_dir)
-            except OSError:
-                pass
-
-        self._session = None
-        if gpu_devices:
-            logger.info("execution providers offer: %s", ", ".join(_device_label(device) for device in devices))
-            try:
-                options = self._session_options()
-                options.add_provider_for_devices(gpu_devices[:1], {})
-                self._session = ort.InferenceSession(str(model_path), sess_options=options)
-                self.device = _device_label(gpu_devices[0])
+                self._benchmark(build())
+                return
             except Exception as exc:
-                logger.warning("GPU device %s failed to initialize: %s", _device_label(gpu_devices[0]), exc)
-                self._session = None
+                self.skipped.append(f"{label} cannot run the model, so detection is not using it: {exc}")
+        self.device = "ONNX CPU"
+        self._benchmark(self._session_on([], [DEFAULT_CPU_PROVIDER]))
 
-        if self._session is None:
-            if "MIGraphXExecutionProvider" in available:
-                try:
-                    options = self._session_options()
-                    self._session = ort.InferenceSession(
-                        str(model_path), sess_options=options, providers=["MIGraphXExecutionProvider", DEFAULT_CPU_PROVIDER]
-                    )
-                    active = self._session.get_providers()
-                    self.device = "AMD GPU" if active and active[0] == "MIGraphXExecutionProvider" else "ONNX CPU"
-                except Exception as exc:
-                    logger.warning("MIGraphX execution provider failed: %s", exc)
-                    self._session = None
-            elif "ROCMExecutionProvider" in available:
-                try:
-                    options = self._session_options()
-                    self._session = ort.InferenceSession(
-                        str(model_path), sess_options=options, providers=["ROCMExecutionProvider", DEFAULT_CPU_PROVIDER]
-                    )
-                    active = self._session.get_providers()
-                    self.device = "AMD GPU" if active and active[0] == "ROCMExecutionProvider" else "ONNX CPU"
-                except Exception as exc:
-                    logger.warning("ROCm execution provider failed: %s", exc)
-                    self._session = None
-            elif "CUDAExecutionProvider" in available:
-                try:
-                    options = self._session_options()
-                    self._session = ort.InferenceSession(
-                        str(model_path), sess_options=options, providers=["CUDAExecutionProvider", DEFAULT_CPU_PROVIDER]
-                    )
-                    active = self._session.get_providers()
-                    self.device = "NVIDIA GPU" if active and active[0] == "CUDAExecutionProvider" else "ONNX CPU"
-                except Exception as exc:
-                    logger.warning("CUDA execution provider failed: %s", exc)
-                    self._session = None
-            elif "CoreMLExecutionProvider" in available:
-                providers = [
-                    (
-                        "CoreMLExecutionProvider",
-                        {"ModelFormat": "MLProgram", "MLComputeUnits": "ALL", "RequireStaticInputShapes": "1"},
-                    ),
-                    DEFAULT_CPU_PROVIDER,
-                ]
-                try:
-                    options = self._session_options()
-                    self._session = ort.InferenceSession(str(model_path), sess_options=options, providers=providers)
-                    self.device = "Apple Core ML"
-                except Exception as exc:
-                    logger.warning("Core ML execution provider failed: %s", exc)
-                    self._session = None
+    def _migraphx_cache(self) -> None:
+        """Gives MIGraphX somewhere to keep the execution plans it compiles for the model.
 
-        if self._session is None:
-            cpu_devices = [d for d in devices if d.device.type.name == "CPU"]
-            if cpu_devices:
-                logger.info("execution providers offer: %s", ", ".join(_device_label(device) for device in cpu_devices))
-                try:
-                    options = self._session_options()
-                    options.add_provider_for_devices(cpu_devices[:1], {})
-                    self._session = ort.InferenceSession(str(model_path), sess_options=options)
-                    self.device = _device_label(cpu_devices[0])
-                except Exception as exc:
-                    logger.warning("CPU device %s failed to initialize: %s", _device_label(cpu_devices[0]), exc)
-                    self._session = None
+        The provider looks a model up by the hash of its graph in
+        `ORT_MIGRAPHX_MODEL_CACHE_PATH` and, with that unset, recompiles the model
+        on every session, failing the load when its compiler has nowhere to write.
+        An APU such as a Strix Halo (`gfx1151`) then spends minutes in each start and
+        never reaches a second inference. The hub's data directory is the folder the
+        host owns and keeps across restarts, so the plans are written once and a
+        later start loads the model at once.
+        """
+        if "ORT_MIGRAPHX_MODEL_CACHE_PATH" in os.environ:
+            return
+        cache_dir = Path(os.environ.get("DATA_DIR", REPO_ROOT / "data")) / "cache" / "migraphx"
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("MIGraphX has no cache directory, so every session recompiles: %s", exc)
+            return
+        os.environ["ORT_MIGRAPHX_MODEL_CACHE_PATH"] = str(cache_dir)
 
-        if self._session is None:
-            options = self._session_options()
-            self._session = ort.InferenceSession(
-                str(model_path), sess_options=options, providers=[DEFAULT_CPU_PROVIDER]
-            )
-            self.device = "ONNX CPU"
+    def _amd_providers(self) -> list[tuple[str, str]]:
+        """Pairs AMD hardware with the providers installed for it, fastest first.
 
-        self._input_name = self._session.get_inputs()[0].name
+        ROCm's and MIGraphX's providers run on the hardware through the host's own
+        driver and register no device of their own, so they are missing from
+        `get_ep_devices` and a host whose only accelerator is one of them comes back
+        with an empty device list: naming the provider is the only way a MIGraphX
+        APU gets in front of the model at all. Each one named is still benchmarked,
+        so a card whose ROCm runtime is missing ends on the CPU with a notice.
 
-    @staticmethod
-    def _session_options() -> ort.SessionOptions:
+        Returns:
+            The hardware and provider name for each AMD provider the host carries.
+        """
+        available = ort.get_available_providers()
+        named = (("AMD GPU", "MIGraphXExecutionProvider"), ("AMD GPU", "ROCMExecutionProvider"))
+        return [(label, provider) for label, provider in named if provider in available]
+
+    def _amd_session(self, provider: str) -> ort.InferenceSession:
+        """Builds a session on a named AMD provider, refusing one it dropped.
+
+        ONNX Runtime answers a provider it cannot start by keeping the CPU in the
+        session rather than failing it, which would leave the compute readout naming
+        an AMD GPU the model never reached, so the provider that stayed is read back
+        and a session that dropped it is refused onto the CPU fallback with the reason.
+
+        Args:
+            provider: Execution provider to run the model on.
+
+        Raises:
+            OSError: The session kept a provider other than the one named.
+        """
+        session = self._session_on([], [provider, DEFAULT_CPU_PROVIDER])
+        kept = session.get_providers()
+        if not kept or kept[0] != provider:
+            raise OSError(f"the session kept {kept[0] if kept else 'no provider'} rather than {provider}")
+        return session
+
+    def _session_on(
+        self, devices: list[ort.OrtEpDevice], providers: list[str | tuple[str, dict[str, str]]] | None = None
+    ) -> ort.InferenceSession:
         options = ort.SessionOptions()
         options.intra_op_num_threads = 1
-        return options
+        if devices:
+            options.add_provider_for_devices(devices, {})
+        return ort.InferenceSession(self._model_path, sess_options=options, providers=providers, enable_fallback=0)
+
+    def _benchmark(self, session: ort.InferenceSession) -> None:
+        self._session = session
+        self._input_name = session.get_inputs()[0].name
+        self.measured = _measure_concurrency(self.run)
+        session.enable_fallback()
 
     def _register_plugins(self) -> None:
         _preload_cuda_runtime()
@@ -279,17 +289,26 @@ class OnnxInference:
         except OSError as error:
             logger.warning("Windows ML is unavailable without the Windows App Runtime 2.x: %s", error)
             return
-        providers = [
-            provider
-            for provider in winml.ExecutionProviderCatalog.get_default().find_all_providers()
-            if provider.name in WINDOWS_PROVIDERS
-        ]
+        try:
+            providers = [
+                provider
+                for provider in winml.ExecutionProviderCatalog.get_default().find_all_providers()
+                if provider.name in WINDOWS_PROVIDERS
+            ]
+        except Exception as error:
+            logger.warning("Windows ML could not list its providers: %s", error)
+            return
         for provider in providers:
-            if provider.ready_state != winml.ExecutionProviderReadyState.READY:
-                result = provider.ensure_ready_async().get()
-                if result.status != winml.ExecutionProviderReadyResultState.SUCCESS:
-                    continue
-            _register_library(provider.name, provider.library_path)
+            try:
+                if provider.ready_state != winml.ExecutionProviderReadyState.READY:
+                    result = provider.ensure_ready_async().get()
+                    if result.status != winml.ExecutionProviderReadyResultState.SUCCESS:
+                        continue
+                library = provider.library_path
+            except Exception as error:
+                logger.warning("execution provider %s could not be installed: %s", provider.name, error)
+                continue
+            _register_library(provider.name, library)
 
     def run(self, tensor: np.ndarray) -> np.ndarray:
         """Returns the model embedding for one preprocessed frame."""
@@ -307,23 +326,32 @@ class LiteRtInference:
     `Interpreter.invoke` releases the GIL, so interpreters held per thread run
     genuinely in parallel; the `CompiledModel` API does not, and serialises every
     caller onto one core no matter how many workers are given to it.
+
+    The model is handed over as bytes: given a path, LiteRT opens it through
+    the ANSI code page on Windows and can fail under a user folder whose name
+    is outside it.
+
+    Attributes:
+        measured: Worker count the processor sustains, and its throughput there.
     """
 
     runtime = "litert"
     device = "LiteRT CPU"
+    skipped: list[str] = []
 
     def __init__(self, model_path: Path) -> None:
-        self._model_path = str(model_path)
+        self._model = model_path.read_bytes()
         self._interpreters = threading.local()
-        probe = Interpreter(model_path=self._model_path, num_threads=1)
+        probe = Interpreter(model_content=self._model, num_threads=1)
         self._input_index = probe.get_input_details()[0]["index"]
         self._output_index = probe.get_output_details()[0]["index"]
+        self.measured = _measure_concurrency(self.run)
 
     def run(self, tensor: np.ndarray) -> np.ndarray:
         """Returns the model embedding for one preprocessed frame."""
         interpreter = getattr(self._interpreters, "interpreter", None)
         if interpreter is None:
-            interpreter = Interpreter(model_path=self._model_path, num_threads=1)
+            interpreter = Interpreter(model_content=self._model, num_threads=1)
             interpreter.allocate_tensors()
             self._interpreters.interpreter = interpreter
         interpreter.set_tensor(self._input_index, tensor)
@@ -336,7 +364,12 @@ class LiteRtInference:
 
 
 class Inference:
-    """Runs the requested model runtime at the concurrency it measurably sustains."""
+    """Runs the requested model runtime at the concurrency it measurably sustains.
+
+    Attributes:
+        skipped: One message for each accelerator that was offered and passed
+            over, whichever runtime was chosen in the end.
+    """
 
     def __init__(self, model_dir: Path, runtime: InferenceRuntime) -> None:
         candidates: list[OnnxInference | LiteRtInference] = []
@@ -344,15 +377,16 @@ class Inference:
             candidates.append(OnnxInference(model_dir / "encoder_float32.onnx"))
         if runtime in ("auto", "litert"):
             candidates.append(LiteRtInference(model_dir / "encoder_float32.tflite"))
-        measured = [_measure_concurrency(candidate.run) for candidate in candidates]
         logger.info(
             "inference benchmark: %s",
             ", ".join(
-                f"{candidate.device} {fps:.1f} fps across {workers} workers"
-                for candidate, (workers, fps) in zip(candidates, measured)
+                f"{candidate.device} {candidate.measured[1]:.1f} fps across {candidate.measured[0]} workers"
+                for candidate in candidates
             ),
         )
-        selected, (self.workers, self.capacity_fps) = max(zip(candidates, measured), key=lambda pair: pair[1][1])
+        self.skipped = [message for candidate in candidates for message in candidate.skipped]
+        selected = max(candidates, key=lambda candidate: candidate.measured[1])
+        self.workers, self.capacity_fps = selected.measured
         for candidate in candidates:
             if candidate is not selected:
                 candidate.close()

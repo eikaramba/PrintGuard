@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
+import json
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
 import pytest
 
 from printguard.engine import urls
@@ -20,6 +27,11 @@ MATCHING = [
     ("http://[fd00::1]/*", "http://[fd00::1]/status"),
     ("http://[fd00::1]:8080/*", "http://[FD00::1]:8080/status"),
     ("https://example.com/v1/*", "https://example.com/v1/a..b/.hidden"),
+    ("https://api.telegram.org/bot*/sendMessage", "https://api.telegram.org/bot123:abc/sendMessage"),
+    ("HTTPS://API.Telegram.org/bot*/sendMessage", "https://API.telegram.ORG/bot1/sendMessage"),
+    ("https://example.com/*/jobs/*/cancel", "https://example.com/v1/jobs/7/jobs/8/cancel"),
+    ("https://example.com/a*a", "https://example.com/aa"),
+    ("https://example.com/*.json*", "https://example.com/feed.json?page=2"),
 ]
 
 REFUSED = [
@@ -38,6 +50,10 @@ REFUSED = [
     ("https://example.com/v1/*", "https://example.com/v1/a/./../../admin"),
     ("https://example.com/v1/*", "https://example.com/v1/..\\admin"),
     ("https://example.com/v1/*", "https://example.com/v1/.."),
+    ("https://api.telegram.org/bot*/sendMessage", "https://api.telegram.org/bot1/sendmessage"),
+    ("https://example.com/a*a", "https://example.com/a"),
+    ("https://example.com/*/jobs/*/cancel", "https://example.com/v1/jobs/cancel"),
+    ("https://example.com/v1/*/a", "https://example.com/v1/b/ab"),
 ]
 
 
@@ -49,6 +65,20 @@ def test_a_pattern_covers_what_it_should(pattern: str, url: str) -> None:
 @pytest.mark.parametrize("pattern,url", REFUSED)
 def test_a_pattern_covers_nothing_else(pattern: str, url: str) -> None:
     assert not urls.matches(pattern, url)
+
+
+def test_a_pattern_keeps_the_case_of_its_path_and_drops_that_of_its_host() -> None:
+    assert urls.sanitise(["HTTPS://API.Telegram.org/bot*/sendMessage"]) == ["https://api.telegram.org/bot*/sendMessage"]
+
+
+def test_a_pattern_full_of_wildcards_is_matched_as_fast_as_any_other() -> None:
+    """The match runs on the event loop, so a slow one stops detection."""
+    pattern = "https://example.com/" + "*a" * 24 + "b"
+    started = time.perf_counter()
+
+    assert not urls.matches(pattern, "https://example.com/" + "a" * 4000)
+    assert urls.matches(pattern, "https://example.com/" + "a" * 4000 + "b")
+    assert time.perf_counter() - started < 0.5
 
 
 def test_malformed_patterns_are_refused_rather_than_ignored() -> None:
@@ -63,6 +93,52 @@ def test_a_pattern_reaching_this_network_is_told_apart_from_one_that_does_not() 
 
     assert all(urls.reaches_local(pattern) for pattern in local)
     assert not any(urls.reaches_local(pattern) for pattern in public)
+
+
+@pytest.mark.parametrize("host", ["2130706433", "127.1", "0x7f.0.0.1", "017700000001", "192.168.257", "0xc0a80132"])
+def test_an_address_is_local_however_it_is_spelt(host: str) -> None:
+    assert urls.is_local_address(host)
+    assert urls.reaches_local(f"http://{host}/*"), "a plugin asked for this network under the public permission"
+
+
+@pytest.mark.parametrize("host", ["134744072", "8.8.2056", "0x8.8.8.8", "1.1.1.1.1", "example.com"])
+def test_an_oddly_spelt_public_address_is_not_local(host: str) -> None:
+    assert not urls.is_local_address(host)
+
+
+def edges() -> list[str]:
+    """Hosts either side of every boundary the address rules draw."""
+    constants = (ipaddress._IPv4Constants, ipaddress._IPv6Constants)
+    networks = [network for family in constants for network in (*family._private_networks, *family._private_networks_exceptions)]
+    networks.append(ipaddress._IPv4Constants._public_network)
+    hosts = ["2130706433", "127.1", "0x7f.0.0.1", "134744072", "1.1.1.1.1", "localhost", "octopi.local", "example.com", "local"]
+    for network in networks:
+        first, last = int(network.network_address), int(network.broadcast_address)
+        for number in {max(first - 1, 0), first, last, min(last + 1, 2**network.max_prefixlen - 1)}:
+            address = ipaddress.ip_address(number) if network.version == 4 else ipaddress.IPv6Address(number)
+            hosts.append(str(address) if network.version == 4 else f"[{address}]")
+            if network.version == 4:
+                hosts.append(f"[::ffff:{address}]")
+    return sorted(set(hosts))
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="the dashboard's copy of the rules runs on node")
+def test_the_dashboard_calls_local_exactly_what_the_engine_does() -> None:
+    """The consent sheet sorts a plugin's addresses with its own copy of the rules.
+
+    Those rules are the ones Python settled on in 3.12.4, so an older patch
+    release, which draws a few of the lines elsewhere, has nothing to compare.
+    """
+    if not hasattr(ipaddress._IPv4Constants, "_private_networks_exceptions"):
+        pytest.skip("this Python predates the address rules the dashboard mirrors")
+    hosts = edges()
+    script = "import('./src/urls.ts').then((urls) => console.log(JSON.stringify(JSON.parse(process.argv[1]).map(urls.isLocalAddress))))"
+    answered = subprocess.run(
+        ["node", "-e", script, json.dumps(hosts)], cwd=Path(__file__).resolve().parent.parent / "web", capture_output=True, text=True, check=True
+    )
+
+    dashboard = dict(zip(hosts, json.loads(answered.stdout)))
+    assert dashboard == {host: urls.is_local_address(host) for host in hosts}
 
 
 def test_a_public_name_pointing_at_a_private_address_counts_as_local(monkeypatch: pytest.MonkeyPatch) -> None:

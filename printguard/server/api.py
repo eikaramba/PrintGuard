@@ -12,7 +12,9 @@ import hmac
 import logging
 from typing import Annotated, Any, Literal
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -22,7 +24,7 @@ from ..engine.notifiers import NOTIFIERS
 from ..engine.reports import is_url, scrub_url, scrub_urls
 from ..engine.tokens import SCOPE_ORDER, expand_scope, hash_secret
 from .platform import OPEN_WAIT_S
-from .prints import PrintUpload, file_response, receive_print
+from .prints import PrintUpload, capped, file_response, receive_print
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +91,13 @@ class PrinterFields(BaseModel):
     config: dict[str, Any] | None = None
 
 
-class MonitorFields(BaseModel):
+class _FiniteNumbers(BaseModel):
+    """Base for the request bodies that carry a number, refusing NaN and Infinity."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+
+class MonitorFields(_FiniteNumbers):
     name: str | None = None
     camera_id: str | None = None
     printer_id: str | None = None
@@ -113,7 +121,7 @@ class CameraCreate(BaseModel):
     source: CameraSource
 
 
-class CameraPatch(BaseModel):
+class CameraPatch(_FiniteNumbers):
     name: str | None = None
     brightness: float | None = None
     contrast: float | None = None
@@ -139,7 +147,7 @@ class ActionBody(BaseModel):
     action: Literal["pause", "resume", "cancel"]
 
 
-class HeatBody(BaseModel):
+class HeatBody(_FiniteNumbers):
     nozzle: float | None = None
     bed: float | None = None
 
@@ -159,6 +167,13 @@ UPLOAD_BODY = {
     "requestBody": {
         "required": True,
         "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}},
+    }
+}
+MAX_FRAME_BYTES = 32 * 1024 * 1024
+FRAME_BODY = {
+    "requestBody": {
+        "required": True,
+        "content": {"image/jpeg": {"schema": {"type": "string", "format": "binary"}}},
     }
 }
 
@@ -254,11 +269,13 @@ def _stored_secrets(config: dict[str, Any], stored: dict[str, Any], secrets: set
 
     Returns:
         The client's config, with each secret field it left out or blank and
-        each URL it sent back scrubbed taken from the stored one.
+        each URL it sent back scrubbed taken from the stored one. A secret
+        field sent as null is cleared, which is the one way to remove one.
     """
-    kept = {key: stored[key] for key in secrets if key in stored and config.get(key) in (None, "")}
+    kept = {key: stored[key] for key in secrets if key in stored and config.get(key, "") == ""}
+    cleared = {key: "" for key in secrets if key in config and config[key] is None}
     unscrubbed = {key: stored[key] for key, value in config.items() if is_url(stored.get(key)) and value == scrub_url(stored[key])}
-    return {**config, **kept, **unscrubbed}
+    return {**config, **kept, **cleared, **unscrubbed}
 
 
 def _public_printer(printer: dict[str, Any]) -> dict[str, Any]:
@@ -282,16 +299,21 @@ def public_state(engine: Engine) -> dict[str, Any]:
     report status without leaking the printer and notifier credentials those
     configs embed, nor the access codes a printer-exposed camera source carries.
     Redaction reuses the secret fields each adapter's schema already declares
-    rather than enumerating credentials here.
+    rather than enumerating credentials here, so a notifier this version does
+    not know, whose secret fields nothing declares, is left out whole. A
+    plugin's store is left out
+    whatever the token's scope, since a plugin may keep a session or anything
+    else it was told in it, and nothing on this surface writes one.
     """
     state = engine.state_event()
+    state["plugins"] = [{key: value for key, value in plugin.items() if key != "config"} for plugin in state["plugins"]]
     state["printers"] = [_public_printer(printer) for printer in state["printers"]]
     state["cameras"] = [_public_camera(camera) for camera in state["cameras"]]
     notifiers = state["settings"].get("notifiers", {})
     mqtt = state["settings"].get("mqtt") or {}
     state["settings"] = {
         **state["settings"],
-        "notifiers": {pid: _public_config(config, NOTIFIERS.get(pid)) for pid, config in notifiers.items()},
+        "notifiers": {pid: _public_config(config, NOTIFIERS[pid]) for pid, config in notifiers.items() if pid in NOTIFIERS},
         "mqtt": {**mqtt, "password": ""} if mqtt.get("password") else mqtt,
     }
     return state
@@ -311,6 +333,12 @@ def build_api_app(auth: ApiAuth) -> FastAPI:
     async def command_failed(request: Request, exc: RuntimeError) -> JSONResponse:
         """Maps a rejected engine command to a 400 instead of a bare 500."""
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @api.exception_handler(RequestValidationError)
+    async def body_refused(request: Request, exc: RequestValidationError) -> JSONResponse:
+        """Answers 422 without echoing the input, since a NaN in it cannot be written as JSON."""
+        errors = [{key: value for key, value in error.items() if key != "input"} for error in exc.errors()]
+        return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
 
     @api.exception_handler(TimeoutError)
     async def command_timeout(request: Request, exc: TimeoutError) -> JSONResponse:
@@ -406,7 +434,7 @@ def build_api_app(auth: ApiAuth) -> FastAPI:
     async def update_printer(printer_id: str, body: PrinterFields, engine: Engine = Depends(get_engine)) -> dict[str, Any]:
         """Updates a printer's name or connection details.
 
-        A secret config field left out or blank keeps its stored value.
+        A secret config field left out or blank keeps its stored value, and null clears it.
         """
         patch = body.model_dump(exclude_none=True)
         stored = engine.printers.get(printer_id)
@@ -504,13 +532,10 @@ def build_api_app(auth: ApiAuth) -> FastAPI:
             raise HTTPException(404, f"no frame available for camera {camera_id!r}")
         return Response(jpeg, media_type="image/jpeg")
 
-    @api.post("/classify", operation_id="classify_frame", tags=["read"])
-    async def classify_frame(
-        image: Annotated[bytes, Body(media_type="image/jpeg")],
-        engine: Engine = Depends(get_engine),
-    ) -> dict[str, Any]:
+    @api.post("/classify", operation_id="classify_frame", tags=["read"], openapi_extra=FRAME_BODY)
+    async def classify_frame(request: Request, engine: Engine = Depends(get_engine)) -> dict[str, Any]:
         """Classifies a supplied JPEG frame - the model's verdict without a registered camera."""
-        return await engine.classify(image)
+        return await engine.classify(b"".join([chunk async for chunk in capped(request.stream(), MAX_FRAME_BYTES)]))
 
     @api.post("/cameras", operation_id="add_camera", tags=["manage"], response_model=list[CameraOut])
     async def add_camera(body: CameraCreate, engine: Engine = Depends(get_engine)) -> list[dict[str, Any]]:
@@ -542,7 +567,7 @@ def build_api_app(auth: ApiAuth) -> FastAPI:
     @api.post("/cameras/refresh-printers", operation_id="refresh_printer_cameras", tags=["manage"])
     async def refresh_printer_cameras(engine: Engine = Depends(get_engine)) -> list[dict[str, Any]]:
         """Re-checks every registered printer and registers any newly exposed cameras."""
-        await engine.request({"cmd": "printer.cameras.refresh"})
+        await engine.request({"cmd": "printer.cameras.refresh"}, timeout=CAMERA_OPEN_TIMEOUT_S)
         return public_state(engine)["cameras"]
 
     @api.get("/events", operation_id="recent_events", tags=["read"])
@@ -554,7 +579,7 @@ def build_api_app(auth: ApiAuth) -> FastAPI:
     async def update_settings(body: SettingsPatch, engine: Engine = Depends(get_engine)) -> dict[str, Any]:
         """Updates engine settings such as configured notifiers.
 
-        A notifier secret or the MQTT password left out or blank keeps its stored value.
+        A notifier secret or the MQTT password left out or blank keeps its stored value, and null clears it.
         """
         patch = body.model_dump(exclude_none=True)
         stored = engine.settings.get("notifiers", {})

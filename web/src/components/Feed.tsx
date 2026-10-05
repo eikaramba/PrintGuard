@@ -22,14 +22,14 @@ export function Feed({
   const rotation = camera?.rotation ?? 0;
   const useCanvas = sharpness > 0 || crop !== null || brightness !== 1 || contrast !== 1 || rotation !== 0;
 
-  useVideoStream(videoRef, camera, active);
+  const { streaming, refused } = useVideoStream(videoRef, camera, active);
 
   useEffect(() => {
     const video = videoRef.current;
     return video && camera ? registerFeed(camera.id, video) : undefined;
   }, [camera?.id]);
 
-  useEffect(() => setPlaying(false), [camera?.id, active]);
+  useEffect(() => setPlaying(false), [camera?.id, streaming]);
 
   useEffect(() => {
     if (!useCanvas) return;
@@ -68,9 +68,14 @@ export function Feed({
       {(!camera || !playing) && (
         <div className="feed-veil absolute inset-0 grid place-items-center bg-ink-0/85 z-[2] pointer-events-none">
           <span className="mono text-[0.65rem] tracking-[0.2em] text-text-2 uppercase">
-            {!camera ? "no camera bound" : camera.standby || camera.online ? "starting stream" : "no signal"}
+            {!camera ? "no camera bound" : refused ? "" : camera.standby || camera.online ? "starting stream" : "no signal"}
           </span>
         </div>
+      )}
+      {camera && refused && !playing && (
+        <button className="btn absolute inset-0 z-[3] m-auto h-fit w-fit" onClick={() => void videoRef.current?.play()}>
+          Tap to play
+        </button>
       )}
       {children}
     </div>
