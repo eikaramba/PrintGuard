@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/oliverbravery/PrintGuard/main/plugins/plugin.schema.json",
   "title": "PrintGuard plugin",
-  "description": "The manifest of a PrintGuard plugin. See https://github.com/oliverbravery/PrintGuard/blob/main/docs/plugins.md",
+  "description": "The manifest of a PrintGuard plugin. See https://github.com/oliverbravery/PrintGuard/blob/main/docs/plugin-development.md",
   "type": "object",
   "required": [
     "id",
@@ -226,12 +226,14 @@
         "authorize_url": {
           "type": "string",
           "format": "uri",
-          "description": "Where the user is sent to sign in."
+          "pattern": "^https://[^*]+$",
+          "description": "Where the user is sent to sign in. One https address."
         },
         "token_url": {
           "type": "string",
           "format": "uri",
-          "description": "Where the code is exchanged for tokens."
+          "pattern": "^https://[^*]+$",
+          "description": "Where the code is exchanged for tokens. One https address, and one on your own network needs net:local."
         },
         "register_url": {
           "type": "string",

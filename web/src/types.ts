@@ -131,6 +131,30 @@ export interface Snapshot {
   action: string;
 }
 
+export interface ReviewFrame extends Omit<Snapshot, "action"> {
+  action?: string;
+  kind: "alert" | "near" | "spaced";
+  size: number;
+}
+
+export interface ReviewSummary {
+  id: string;
+  monitor_id: string;
+  started: number;
+  ended: number | null;
+  status: "running" | "ready" | "dismissed" | "queued" | "sent";
+  frames: number;
+  alerts: number;
+  chosen: number;
+  sent: number;
+  code: string | null;
+  retry_at: number | null;
+}
+
+export interface Review extends Omit<ReviewSummary, "frames"> {
+  frames: ReviewFrame[];
+}
+
 export interface HistoryAlert {
   ts: number;
   score: number;
@@ -273,7 +297,7 @@ export interface PluginRecord {
   manifest: PluginManifest;
   files: string[];
   digests: Record<string, string>;
-  source: { kind: string; repo?: string; path?: string; ref?: string; filename?: string };
+  source: { kind: string; repo?: string; path?: string; ref?: string; branch?: string; filename?: string };
   granted: string[];
   config: Record<string, unknown>;
   secrets_set: string[];
@@ -366,6 +390,8 @@ export interface EngineState {
   cameras: Camera[];
   printers: Printer[];
   prints: PrintFile[];
+  reviews: ReviewSummary[];
+  feedback_hub: string | null;
   monitors: Monitor[];
   settings: {
     notifiers: Record<string, Record<string, string>>;
@@ -379,6 +405,7 @@ export interface EngineState {
     catalogue_url: string;
     fault_grace_s: number;
     preheat: PreheatPreset[];
+    feedback: "ask" | "off";
   };
   tokens: ApiToken[];
   stats: EngineStats;
@@ -399,6 +426,6 @@ export interface ScorePoint {
 }
 
 export interface EngineLink {
-  send(cmd: Record<string, unknown>): void;
+  send(cmd: Record<string, unknown>): boolean;
   close(): void;
 }

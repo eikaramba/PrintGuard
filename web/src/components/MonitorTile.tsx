@@ -1,4 +1,5 @@
 import { section, toggleHidden, togglePinned } from "../layout";
+import { awaitingReview } from "../review";
 import { useStore } from "../store";
 import type { DeviceState, Monitor } from "../types";
 import { Feed } from "./Feed";
@@ -20,12 +21,14 @@ export function DeviceChip({ state }: { state: DeviceState | undefined }) {
 }
 
 export function MonitorTile({ monitor, index }: { monitor: Monitor; index: number }) {
-  const { engine, history, openDetail, customising, mutateLayout, dialog, detailId, statsMonitorId } = useStore();
-  const covered = dialog !== null || detailId !== null || statsMonitorId !== null;
+  const { engine, history, openDetail, openReview, customising, mutateLayout, dialog, detailId, statsMonitorId, reviewId } = useStore();
+  const covered = dialog !== null || detailId !== null || statsMonitorId !== null || reviewId !== null;
+  const awaiting = awaitingReview(engine?.reviews ?? [], monitor.id);
   const camera = engine?.cameras.find((c) => c.id === monitor.camera_id);
   const printer = engine?.printers.find((p) => p.id === monitor.printer_id);
   const device = printer?.device_state;
-  const score = history[monitor.id]?.at(-1)?.score ?? 0;
+  const live = Boolean(camera?.online);
+  const score = live ? (history[monitor.id]?.at(-1)?.score ?? 0) : null;
   const alerting = Boolean(monitor.alert);
   const pinned = section(engine?.settings.layout, "monitors").pinned.includes(monitor.id);
   const tools = usePluginSurface("monitor", monitor.id);
@@ -74,7 +77,7 @@ export function MonitorTile({ monitor, index }: { monitor: Monitor; index: numbe
         ) : (
           <>
             <DeviceChip state={printer?.device_state ?? undefined} />
-            {!monitor.watching && <span className="chip">standby</span>}
+            {!monitor.watching && <span className="chip">{camera ? "standby" : "no camera"}</span>}
             {tools.map(({ plugin, node }) => (
               <span key={plugin.id} className="relative z-[3]">
                 <PluginNodeView plugin={plugin} node={node} />
@@ -87,7 +90,7 @@ export function MonitorTile({ monitor, index }: { monitor: Monitor; index: numbe
         {activeJob(device) && <ProgressBar state={device} className="absolute inset-x-0 bottom-0 z-[3] h-[3px]" />}
       </Feed>
       {alerting && (
-        <div className="absolute inset-x-0 top-[calc(50%-14px)] z-[4] flex justify-center">
+        <div className="pointer-events-none absolute inset-x-0 top-[calc(50%-14px)] z-[4] flex justify-center">
           <span className="display bg-bad text-on-accent text-xs font-bold tracking-[0.3em] px-4 py-1.5">
             DEFECT DETECTED
           </span>
@@ -98,7 +101,7 @@ export function MonitorTile({ monitor, index }: { monitor: Monitor; index: numbe
         <div className="flex-1 grid grid-cols-2 gap-x-4 gap-y-1">
           <div>
             <div className="mono text-[0.8rem]">
-              {camera ? `${camera.achieved_fps.toFixed(1)}/${camera.target_fps.toFixed(1)}` : "—"}
+              {camera && live ? `${camera.achieved_fps.toFixed(1)}/${camera.target_fps.toFixed(1)}` : "—"}
             </div>
             <div className="label">infer fps</div>
           </div>
@@ -119,6 +122,13 @@ export function MonitorTile({ monitor, index }: { monitor: Monitor; index: numbe
           })}
         </div>
       </div>
+      {awaiting && !handle && (
+        <div className="px-4 pb-2.5">
+          <button className="btn relative z-[3] w-full !text-[0.7rem]" onClick={() => openReview(awaiting.id)}>
+            Review {awaiting.frames} frames from the last print
+          </button>
+        </div>
+      )}
     </>
   );
 

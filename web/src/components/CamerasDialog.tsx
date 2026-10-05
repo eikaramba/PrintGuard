@@ -21,6 +21,7 @@ function CameraRow({ camera, focus }: { camera: Camera; focus: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
   const owner = camera.printer_id ? engine?.printers.find((p) => p.id === camera.printer_id) : null;
   const managed = Boolean(owner) || Boolean(camera.declared);
+  const detectFpsCeiling = Math.min(60, Math.ceil(camera.max_fps));
 
   useEffect(() => {
     if (focus) {
@@ -89,6 +90,16 @@ function CameraRow({ camera, focus }: { camera: Camera; focus: boolean }) {
             max={2}
             step={0.1}
             onChange={(v) => updateCamera(camera.id, { sharpness: v })}
+          />
+          <Slider
+            label="Detection rate"
+            value={Math.min(camera.detect_fps, detectFpsCeiling)}
+            min={0.5}
+            max={detectFpsCeiling}
+            step={0.5}
+            format={(v) => `${v} fps`}
+            hint="Lower it to lighten the load on the hub. A defect then takes longer to confirm."
+            onChange={(v) => updateCamera(camera.id, { detect_fps: v })}
           />
           <div className="space-y-1.5">
             <span className="label">Detection rate</span>
@@ -224,7 +235,7 @@ function DevicePicker({ onAdd, hint }: { onAdd: (name: string, source: CameraSou
 type AddTab = "url" | "machine" | "browser";
 
 function AddCamera({ onDeviceAdd }: { onDeviceAdd: (name: string, source: CameraSource) => void }) {
-  const { send, toast, isPending } = useStore();
+  const { send, toast, isPending, addPublishedCamera } = useStore();
   const desktopApp = "pywebview" in window;
   const [tab, setTab] = useState<AddTab>("url");
   const [name, setName] = useState("");
@@ -244,7 +255,7 @@ function AddCamera({ onDeviceAdd }: { onDeviceAdd: (name: string, source: Camera
   const publish = async () => {
     setBusy(true);
     try {
-      const path = `dev-${slug(name || "camera")}`;
+      const path = `dev-${slug(name || "camera")}-${Date.now().toString(36)}`;
       const { hlsPlayable } = await publishStream(path, deviceId, (reason) =>
         toast("error", `publishing stopped: ${reason}`),
       );
@@ -252,7 +263,7 @@ function AddCamera({ onDeviceAdd }: { onDeviceAdd: (name: string, source: Camera
         toast("alert", "this browser records VP8, so monitoring works and you can preview it here, but other devices can't view this camera");
       }
       await new Promise((r) => setTimeout(r, 800));
-      send({ cmd: "camera.add", name: name || "Published camera", source: { kind: "path", path } });
+      addPublishedCamera(name || "Published camera", path);
     } catch (err) {
       toast("error", `publish failed: ${err}`);
     } finally {

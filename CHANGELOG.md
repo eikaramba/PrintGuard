@@ -7,26 +7,86 @@ release notes.
 The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.5.1] - 2026-10-05
 
 ### Added
 
-- Support for AMD hardware acceleration in ONNX Runtime via MIGraphX (`MIGraphXExecutionProvider`)
-  and ROCm (`ROCMExecutionProvider`), automatically active when running on AMD GPUs and APUs
-  (such as AMD Strix Halo) with shared `/dev/dri` and `/dev/kfd` access. Compiled graph execution
-  plans are automatically cached under the data directory.
-- Native Linux and Proxmox LXC deployment support without Docker, including automated
-  container creation and native installer scripts in `proxmox/`.
-- Automatic detection of a standalone MediaMTX binary on `PATH` when `MEDIAMTX_BINARY` is not
-  explicitly exported.
+- A detection rate for each camera, under **Cameras**. Lower it to cut the load PrintGuard puts
+  on a shared host. A defect takes longer to confirm at a lower rate. Thanks to @eikaramba.
+- A review at the end of each print. PrintGuard keeps a few frames per print on your hub, and you
+  can label them and send them to help train the detection model. Nothing is sent unless you
+  press Send, and **Settings**, under **Advanced**, switches the prompt off.
+  [What's sent](docs/feedback.md). Thanks to @eikaramba.
 
-## [2.5.1] - 2026-09-24
+### Changed
+
+- The hub only answers to IP addresses, `localhost`, local names such as `printguard.local` and
+  the addresses in `PRINTGUARD_ORIGINS`, which stops a DNS rebinding page reaching it. If you open
+  PrintGuard at a domain, through a tunnel or a proxy, add that address to `PRINTGUARD_ORIGINS`
+  before updating. [Host and origin checking](docs/deployment.md#host-and-origin-checking).
+- Live scores, alerts, warnings, printer status and errors only reach a plugin granted
+  **Read the dashboard**.
+- A plugin's request doesn't follow redirects, and its sign-in endpoints must be https.
+- Bug report attachments are capped at 10 MB.
 
 ### Fixed
 
+- The Windows desktop app opens its window when the zip was downloaded in a browser and
+  extracted with Explorer. It used to show only the tray icon.
+- The Windows desktop app no longer opens a terminal window for its video server.
+- The desktop app says so when another program is using its port. On Windows it used to start
+  anyway and could show that program's page in its window.
+- The Windows desktop app opens the dashboard in your browser on a PC without WebView2, where
+  it used to show a blank window.
+- A desktop app window that fails to open writes the reason to the log.
+- Alert snapshots in the risk history survive a restart.
 - A camera looking at a still scene holds a steady score, where a grainy webcam used to jump
   by 20 points or more from frame to frame. Frames are shrunk for the model the way it was
   trained, which also stops noise pulling a failing print's score under the threshold.
+- Restarting PrintGuard while an idle printer is switched off no longer warns that the printer
+  and its camera are offline. The printer's last status is kept across restarts.
+- `PRINTGUARD_PLUGINS=off` switches off every plugin, including the half that runs in your
+  dashboard. It used to stop only the half on the hub.
+- A new API token's secret is only sent to the dashboard tab that created it, where every open tab used to receive it.
+- A full data volume no longer stops defect detection, printer pauses or push notifications.
+- A failed printer poll or health check is reported and retried, where it used to end monitoring
+  until a restart.
+- A monitor whose camera is missing warns that it has no camera and no longer reads as watching.
+  A USB or printer camera that disappears and comes back is watched again without re-binding.
+- A printer's camera follows the printer to a new address or access code.
+- A Bambu pause, cancel, heater target or print start the printer rejects is reported as failed,
+  including with Developer Mode off or a wrong access code.
+- PrintGuard holds one connection to a Bambu printer, where it used to reconnect and ask for a
+  full report every 5 seconds.
+- Bambu H2C, H2D and H2S printers start an uploaded print.
+- An Elegoo Centauri Carbon command the printer refuses is reported as failed, and one that stops
+  reporting shows offline.
+- A Klipper print that uploads but doesn't start is reported as failed.
+- OctoPrint's webcam is found when OctoPrint is registered on port 5000, and Prusa uploads skip
+  read-only storage.
+- ntfy alerts send when a monitor name has accents or other non-ASCII characters.
+- A cooldown of zero no longer repeats the pause or cancel command on every defect frame, and
+  switching a monitor off resets its defect streak.
+- A plugin that gates the hub and then fails refuses every request until you enable or remove it,
+  where it used to leave the hub open.
+- A plugin sign-in survives a restart straight after connecting.
+- Home Assistant shows the hub as unavailable after it stops, the MQTT bridge recovers from a bad
+  setting, two hubs can share a broker and an unrecognised payload no longer disables a monitor.
+- A damaged `state.json` is kept as `state.json.corrupt`, where it used to be overwritten with an
+  empty hub.
+- Passwords in camera, printer and notifier addresses no longer appear in errors, the API or bug
+  reports.
+- Editing settings or a printer over REST no longer wipes its secrets, adding a slow camera over
+  REST or MCP no longer times out at 15 seconds and MCP returns alert snapshots as images.
+- The dashboard shows when it has lost the hub and re-sends unsaved changes once it reconnects.
+- Downloading diagnostics or signing a plugin in no longer fires in every open dashboard.
+- Closing Settings while editing a custom theme no longer leaves the theme controls dead, and
+  selecting text and releasing outside a dialog no longer closes it.
+- Copy buttons work when the hub is reached over plain http, and Download logs saves the file in
+  the desktop app.
+- Clicking the defect banner on a tile opens the monitor, and a tile whose camera is offline no
+  longer shows its last inference rate and risk as current.
+- Reviewed frames interrupted by a restart are sent afterwards.
 
 ## [2.5.0] - 2026-09-21
 

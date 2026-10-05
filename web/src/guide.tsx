@@ -31,8 +31,8 @@ export const INTRO: GuideSection[] = [
     body: (
       <>
         A vision model running on your own hardware scores every frame from your printer camera. When
-        a defect holds it pauses or cancels the print and sends you a snapshot. No frame ever leaves
-        your network.
+        a defect holds it pauses or cancels the print and sends you a snapshot. No frame leaves your
+        network unless you choose to send it.
       </>
     ),
   },
@@ -43,7 +43,7 @@ export const INTRO: GuideSection[] = [
     shot: "cameras",
     body: (
       <>
-        A camera is any video source PrintGuard can read, so a USB device or an RTSP, MJPEG or WebRTC
+        A camera is any video source PrintGuard can read, so a USB device or an RTSP, RTMP, MJPEG or WebRTC
         stream. A printer is optional, and connecting one lets PrintGuard read whether it is printing
         and stop it when something goes wrong.
       </>
@@ -112,7 +112,7 @@ export const GUIDE: GuideSection[] = [
       <>
         PrintGuard watches your printer cameras with an on-device vision model, pauses or cancels the
         print when a defect holds, and pushes a snapshot to your phone. There's no cloud and no subscription,
-        your frames never leave hardware you own.
+        and your frames stay on hardware you own unless you choose to send them.
       </>
     ),
   },
@@ -226,7 +226,7 @@ export const GUIDE: GuideSection[] = [
     body: (
       <>
         Reorder, pin and hide monitors and cameras with the ▦ Customise toggle, and switch between
-        light, dark and your own custom themes. Your layout and theme sync to every browser that opens
+        light, dark, glass and your own custom themes. Your layout and theme sync to every browser that opens
         the hub.
       </>
     ),
@@ -259,7 +259,7 @@ export const GUIDE: GuideSection[] = [
         Plugins are third-party code, so they run in a sandbox with only what you grant them.{" "}
         <strong>Picture in picture</strong>, <strong>Alert sounds</strong>, <strong>Progress reports</strong>{" "}
         and <strong>Spotify</strong> come as standard.{" "}
-        <a className={link} href={docs("plugins.md")} target="_blank" rel="noreferrer">
+        <a className={link} href={docs("plugin-development.md")} target="_blank" rel="noreferrer">
           Writing one ↗
         </a>
       </>
@@ -272,8 +272,10 @@ export const GUIDE: GuideSection[] = [
     title: "Your frames stay yours",
     body: (
       <>
-        Inference runs entirely on your own hardware. No frames, snapshots or scores are ever sent
-        to a third party.
+        Inference runs entirely on your own hardware. PrintGuard keeps a few frames from each print
+        on your hub, and after a print you can label them and send them to me to train the detection
+        model. Nothing is sent unless you press Send, and you can switch the prompt off in Settings,
+        under Advanced.
       </>
     ),
   },
@@ -285,7 +287,7 @@ export const GUIDE: GuideSection[] = [
       <>
         Report a bug from the <Bug className="inline h-[1.15em] w-[1.15em] align-[-0.2em]" aria-hidden /> chip in the header,
         anonymously, no account needed. A diagnostics bundle goes with it, with every credential stripped and no
-        camera frames. Download the same bundle from that dialog to read it or send it somewhere else yourself.
+        camera frames unless you attach them. Download the same bundle from that dialog to read it or send it somewhere else yourself.
       </>
     ),
     action: { label: "Report a bug", dialog: "report" },

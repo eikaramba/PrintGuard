@@ -8,7 +8,7 @@ disk. Those services live behind these protocols, implemented by the hub in
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncIterable, Awaitable, Callable, Protocol
+from typing import TYPE_CHECKING, Any, AsyncIterable, AsyncIterator, Awaitable, Callable, Protocol
 
 import numpy as np
 
@@ -54,12 +54,17 @@ class FrameSource(Protocol):
         ...
 
 
-class FileStore(Protocol):
-    """Where uploaded print files and their previews live.
+async def as_chunks(data: bytes) -> AsyncIterator[bytes]:
+    """Presents bytes already in memory as the chunks a file store writes."""
+    yield data
 
-    A sliced file is far too large for the state the engine persists as JSON,
-    so the bytes are kept here under a key the engine chooses and the state
-    carries only the record describing them.
+
+class FileStore(Protocol):
+    """Where uploaded print files, their previews and kept frames live.
+
+    A sliced file or a JPEG is far too large for the state the engine persists
+    as JSON, so the bytes are kept here under a key the engine chooses and the
+    state carries only the record describing them.
     """
 
     async def store(self, key: str, chunks: AsyncIterable[bytes]) -> int:
@@ -98,8 +103,14 @@ class PluginRuntime(Protocol):
         """Accepts an engine event for delivery to the running plugins."""
         ...
 
-    async def reload(self, running: "list[Plugin]") -> None:
-        """Replaces the running set, starting and stopping sandboxes to match."""
+    async def reload(self, running: "list[Plugin]", failed_gates: set[str]) -> None:
+        """Replaces the running set, starting and stopping sandboxes to match.
+
+        Args:
+            running: The enabled plugins.
+            failed_gates: Plugins holding ``gate`` that stopped on a failure.
+                Every request is refused while there is one.
+        """
         ...
 
     async def serve(self, plugin_id: str, request: dict[str, Any]) -> dict[str, Any] | None:
@@ -107,7 +118,9 @@ class PluginRuntime(Protocol):
         ...
 
     async def authorise(self, request: dict[str, Any]) -> bool | None:
-        """Asks any gating plugin to allow a request, returning None when none gates."""
+        """Asks any gating plugin to allow a request, returning None when none gates.
+
+        A gate that has failed refuses."""
         ...
 
     def gate_paths(self) -> tuple[str, ...]:
@@ -141,7 +154,7 @@ class Platform(Protocol):
     switched off at boot."""
 
     files: FileStore
-    """Where uploaded print files are kept."""
+    """Where uploaded print files and kept frames are stored."""
 
     async def configure(self, settings: dict[str, Any]) -> None:
         """Applies platform-owned settings before inference starts."""
@@ -173,8 +186,14 @@ class Platform(Protocol):
         data: bytes | None = None,
         binary: bool = False,
         timeout: float = 10.0,
+        follow_redirects: bool = True,
     ) -> tuple[int, Any]:
-        """Performs an HTTP request and returns (status, parsed body)."""
+        """Performs an HTTP request and returns (status, parsed body).
+
+        A plugin's request passes ``follow_redirects=False`` and gets the
+        redirect itself back, since only the address it named was checked
+        against its grant.
+        """
         ...
 
     async def open_socket(self, url: str, arrived: Callable[[str, str], None]) -> sockets.Socket:
